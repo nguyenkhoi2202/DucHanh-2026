@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
-import { generateSHA256 } from '../utils/crypto';
+import { api } from '../api';
 import { Heart, Lock, User, KeyRound, AlertCircle } from 'lucide-react';
 
 interface LoginProps {
-  onLoginSuccess: (expireTime: number) => void;
+  onLoginSuccess: () => void;
 }
 
 export default function Login({ onLoginSuccess }: LoginProps) {
@@ -18,29 +18,11 @@ export default function Login({ onLoginSuccess }: LoginProps) {
     setIsLoading(true);
 
     try {
-      const correctUsername = 'duchanh';
-      // SHA-256 string for password "123"
-      const correctPassHash = '991a3defd73e481618e9cd44694d9181b8cebc5b3842b28fafec24f89ea63a18';
-      
-      const pwdHash = await generateSHA256(password.trim());
-
-      if (username.trim() === correctUsername && pwdHash === correctPassHash) {
-        const now = new Date();
-        const expireTime = now.getTime() + 60 * 60 * 1000; // 1 hour session
-        onLoginSuccess(expireTime);
-      } else {
-        setErrorVisible(true);
-      }
+      await api.login(username, password);
+      onLoginSuccess();
     } catch (err) {
-      console.error('Error standard password hashing', err);
-      // Fallback if crypto is unavailable or blocked in iframe sandbox
-      if (username.trim() === 'duchanh' && password.trim() === '123') {
-        const now = new Date();
-        const expireTime = now.getTime() + 60 * 60 * 1000;
-        onLoginSuccess(expireTime);
-      } else {
-        setErrorVisible(true);
-      }
+      console.error('Login failed', err);
+      setErrorVisible(true);
     } finally {
       setIsLoading(false);
     }
@@ -74,7 +56,7 @@ export default function Login({ onLoginSuccess }: LoginProps) {
                 autoComplete="username"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
-                placeholder="duchanh"
+                placeholder="Tên đăng nhập"
                 required
                 className="w-full pl-10 pr-4 py-3 bg-slate-50 border border-slate-200 rounded-lg text-slate-700 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:border-transparent transition-all"
               />

@@ -19,7 +19,25 @@ export interface DentalRecord {
   plan: PlanItem[];
 }
 
-export interface SessionInfo {
-  isLoggedIn: boolean;
-  expireAt: number;
+export type DentalRecordInput = Omit<DentalRecord, 'id'>;
+
+export interface PaymentRequest {
+  id: number;
+  code: string;
+  patientId: number | null;
+  patientName: string | null;
+  amount: number;
+  status: 'pending' | 'paid';
+  createdAt: number;
+  paidAt: number | null;
+  paidAmount: number | null; // what the bank actually received (can exceed amount)
+  bankReference: string | null;
+}
+
+export interface BankConfig {
+  bankCode: string;
+  bankName: string;
+  accountNo: string;
+  accountName: string;
+  sepayEnabled: boolean;
 }

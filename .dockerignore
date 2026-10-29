@@ -1,0 +1,11 @@
+node_modules
+dist
+dist-server
+data
+deploy
+.env
+.env.*
+!.env.example
+.git
+.playwright-mcp
+*.log

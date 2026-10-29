@@ -1,0 +1,31 @@
+# Chạy trên server:  docker compose up -d --build
+# Cần có: .env (copy từ .env.example), data/ (chứa duchanh.db), cloudflared/ (config.yml + credentials .json)
+services:
+  app:
+    build: .
+    image: duchanh-app:latest
+    container_name: duchanh-app
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DB_PATH: /app/data/duchanh.db
+    volumes:
+      - ./data:/app/data
+    # Only reachable from this machine (3000 is taken by another app on the server);
+    # the public goes through the Cloudflare Tunnel over the compose network
+    ports:
+      - "127.0.0.1:3010:3000"
+
+  tunnel:
+    image: cloudflare/cloudflared:2025.10.0
+    container_name: duchanh-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
+    volumes:
+      - ./cloudflared:/etc/cloudflared:ro
+    depends_on:
+      app:
+        condition: service_healthy

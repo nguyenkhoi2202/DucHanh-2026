@@ -70,7 +70,7 @@ export default function DentalRecordsTable({ records, onEdit }: DentalRecordsTab
     if (porcelainTeethOnly) {
       const hasPorcelain = (rec.plan || []).some((item) => {
         const treatmentVal = (item.treatment || '').toLowerCase();
-        return treatmentVal.includes('dental');
+        return treatmentVal.includes('sứ');
       });
       if (!hasPorcelain) return false;
     }
@@ -86,6 +86,16 @@ export default function DentalRecordsTable({ records, onEdit }: DentalRecordsTab
   const validCurrentPage = Math.min(currentPage, totalPages);
   const startIndex = (validCurrentPage - 1) * itemsPerPage;
   const paginatedRecords = filteredRecords.slice(startIndex, startIndex + itemsPerPage);
+
+  // Page buttons: first, last and two either side of the current page; null marks a gap
+  const pageNumbers: (number | null)[] = [];
+  for (let p = 1; p <= totalPages; p++) {
+    if (p === 1 || p === totalPages || Math.abs(p - validCurrentPage) <= 2) {
+      pageNumbers.push(p);
+    } else if (pageNumbers[pageNumbers.length - 1] !== null) {
+      pageNumbers.push(null);
+    }
+  }
 
   // Clear all filters
   function handleClearFilters() {
@@ -355,7 +365,10 @@ export default function DentalRecordsTable({ records, onEdit }: DentalRecordsTab
               <ChevronLeft size={14} className="inline mr-0.5" /> Trước
             </button>
 
-            {Array.from({ length: totalPages }, (_, idx) => idx + 1).map((p) => (
+            {pageNumbers.map((p, idx) =>
+              p === null ? (
+                <span key={`gap-${idx}`} className="px-1 text-xs text-slate-400">…</span>
+              ) : (
               <button
                 key={p}
                 onClick={() => setCurrentPage(p)}
@@ -367,7 +380,8 @@ export default function DentalRecordsTable({ records, onEdit }: DentalRecordsTab
               >
                 {p}
               </button>
-            ))}
+              )
+            )}
 
             <button
               onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}

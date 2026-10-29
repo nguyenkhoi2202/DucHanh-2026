@@ -56,7 +56,7 @@ export default function TotalsDialog({ isOpen, onClose, title, totalCost, totalP
                 </div>
               </div>
               <span className="text-lg font-bold text-slate-800 font-mono">
-                {totalCost.toLocaleString('vi-VN')} VND
+                {(totalCost * 1000).toLocaleString('vi-VN')} VND
               </span>
             </div>
 
@@ -72,7 +72,7 @@ export default function TotalsDialog({ isOpen, onClose, title, totalCost, totalP
                 </div>
               </div>
               <span className="text-lg font-bold text-teal-600 font-mono">
-                {totalPaid.toLocaleString('vi-VN')} VND
+                {(totalPaid * 1000).toLocaleString('vi-VN')} VND
               </span>
             </div>
 
@@ -88,7 +88,7 @@ export default function TotalsDialog({ isOpen, onClose, title, totalCost, totalP
                 </div>
               </div>
               <span className={`text-lg font-bold font-mono ${totalRemaining > 0 ? 'text-rose-600' : 'text-slate-800'}`}>
-                {totalRemaining.toLocaleString('vi-VN')} VND
+                {(totalRemaining * 1000).toLocaleString('vi-VN')} VND
               </span>
             </div>
           </div>

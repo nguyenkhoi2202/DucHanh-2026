@@ -1,37 +1,56 @@
-import React from 'react';
-import { X, Copy, Check } from 'lucide-react';
+import React, { useEffect } from 'react';
+import { X, Copy, Check, Loader2 } from 'lucide-react';
+import { api, buildQrUrl } from '../api';
+import type { BankConfig, PaymentRequest } from '../types';
 
 interface VietQRPopupProps {
-  isOpen: boolean;
+  request: PaymentRequest | null;
+  config: BankConfig | null;
+  patientName: string;
   onClose: () => void;
-  qrImageUrl: string;
-  amount: number;
-  addInfo: string;
+  onPaid: (request: PaymentRequest) => void;
 }
 
-export default function VietQRPopup({ isOpen, onClose, qrImageUrl, amount, addInfo }: VietQRPopupProps) {
+export default function VietQRPopup({ request, config, patientName, onClose, onPaid }: VietQRPopupProps) {
   const [copied, setCopied] = React.useState(false);
 
-  if (!isOpen) return null;
+  // SePay pushes payment events over the realtime channel; this poll is a
+  // fallback in case that connection dropped while the QR was on screen.
+  useEffect(() => {
+    if (!request || !config?.sepayEnabled) return;
+    const timer = setInterval(async () => {
+      try {
+        const latest = await api.getPaymentRequest(request.id);
+        if (latest.status === 'paid') onPaid(latest);
+      } catch (err) {
+        console.error('Payment status poll failed', err);
+      }
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [request, config, onPaid]);
+
+  if (!request || !config) return null;
+
+  const qrImageUrl = buildQrUrl(config, request.amount, request.code);
 
   function handleCopyInfo() {
-    navigator.clipboard.writeText(addInfo);
+    navigator.clipboard.writeText(request!.code);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   }
 
   return (
     <div id="qr_popup_overlay" className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs animate-fade-in">
-      <div 
-        id="qr_popup" 
+      <div
+        id="qr_popup"
         className="bg-white rounded-2xl shadow-2xl max-w-md w-full overflow-hidden transform scale-100 transition-transform duration-300 relative border border-slate-100"
       >
         {/* Header */}
         <div className="flex items-center justify-between p-4 bg-gradient-to-r from-teal-500 to-cyan-600 text-white">
-          <h3 className="font-bold text-lg tracking-tight">Mã VietQR Nha Khoa</h3>
-          <button 
+          <h3 className="font-bold text-lg tracking-tight">Mã QR thanh toán</h3>
+          <button
             id="close_qr_btn"
-            onClick={onClose} 
+            onClick={onClose}
             className="text-white hover:bg-white/10 rounded-full p-1.5 transition-colors cursor-pointer"
           >
             <X size={20} />
@@ -40,42 +59,52 @@ export default function VietQRPopup({ isOpen, onClose, qrImageUrl, amount, addIn
 
         {/* Content */}
         <div className="p-6 flex flex-col items-center">
-          <p className="text-sm font-medium text-slate-500 mb-1">Quét mã để thanh toán qua MBBank</p>
+          <p className="text-sm font-medium text-slate-500 mb-1">
+            {patientName ? `${patientName} · ` : ''}Quét mã bằng app ngân hàng bất kỳ
+          </p>
           <p className="text-xl font-bold text-slate-800 mb-4 font-mono">
-            {amount.toLocaleString('vi-VN')} VND
+            {request.amount.toLocaleString('vi-VN')} VND
           </p>
 
-          <div className="p-3 bg-teal-50/50 rounded-xl border border-teal-100/60 shadow-inner mb-4 flex justify-center items-center w-64 h-64">
-            {qrImageUrl ? (
-              <img 
-                id="qr_image" 
-                src={qrImageUrl} 
-                alt="VietQR Code" 
-                referrerPolicy="no-referrer"
-                className="w-full h-full object-contain rounded-lg"
-              />
-            ) : (
-              <div className="flex flex-col items-center justify-center space-y-2 text-slate-400">
-                <span className="w-8 h-8 border-2 border-teal-500 border-t-transparent rounded-full animate-spin"></span>
-                <span className="text-xs">Đang tạo mã QR...</span>
-              </div>
-            )}
+          <div className="relative p-3 bg-teal-50/50 rounded-xl border border-teal-100/60 shadow-inner mb-4 flex justify-center items-center w-64 h-64">
+            <img
+              id="qr_image"
+              src={qrImageUrl}
+              alt="Mã QR thanh toán"
+              referrerPolicy="no-referrer"
+              className="w-full h-full object-contain rounded-lg"
+            />
           </div>
+
+          {config.sepayEnabled ? (
+            <p className="flex items-center gap-1.5 text-xs text-slate-500 mb-4">
+              <Loader2 size={13} className="animate-spin text-teal-500" />
+              Đang chờ ngân hàng xác nhận... Màn hình sẽ tự chuyển khi nhận được tiền.
+            </p>
+          ) : (
+            <p className="text-[11px] text-amber-600 mb-4 text-center">
+              Chưa cấu hình SePay: hãy kiểm tra app ngân hàng để xác nhận đã nhận tiền.
+            </p>
+          )}
 
           <div className="w-full bg-slate-50 rounded-xl p-4 border border-slate-100 text-left space-y-2">
             <div className="grid grid-cols-3 text-xs text-slate-500">
+              <span className="font-semibold col-span-1">Ngân hàng:</span>
+              <span className="col-span-2 text-slate-700 font-medium">{config.bankName}</span>
+            </div>
+            <div className="grid grid-cols-3 text-xs text-slate-500">
               <span className="font-semibold col-span-1">Chủ tài khoản:</span>
-              <span className="col-span-2 text-slate-700 font-medium">TRAN THI HA MY</span>
+              <span className="col-span-2 text-slate-700 font-medium">{config.accountName}</span>
             </div>
             <div className="grid grid-cols-3 text-xs text-slate-500">
               <span className="font-semibold col-span-1">Số tài khoản:</span>
-              <span className="col-span-2 text-slate-700 font-semibold font-mono">888 974 974</span>
+              <span className="col-span-2 text-slate-700 font-semibold font-mono">{config.accountNo}</span>
             </div>
             <div className="grid grid-cols-3 text-xs text-slate-500">
               <span className="font-semibold col-span-1">Nội dung chuyển:</span>
               <span className="col-span-2 text-slate-700 break-words flex items-center justify-between gap-1 bg-white p-1.5 rounded border border-slate-100">
-                <span className="line-clamp-2 text-[11px] font-mono leading-tight">{addInfo}</span>
-                <button 
+                <span className="text-[11px] font-mono font-bold leading-tight">{request.code}</span>
+                <button
                   onClick={handleCopyInfo}
                   className="text-teal-600 hover:text-teal-700 hover:bg-teal-50 p-1 rounded shrink-0 transition-colors cursor-pointer"
                   title="Sao chép nội dung"
@@ -89,8 +118,8 @@ export default function VietQRPopup({ isOpen, onClose, qrImageUrl, amount, addIn
 
         {/* Footer */}
         <div className="px-6 py-4 bg-slate-50 border-t border-slate-100 flex justify-end">
-          <button 
-            onClick={onClose} 
+          <button
+            onClick={onClose}
             className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 font-medium text-sm rounded-lg transition-colors cursor-pointer"
           >
             Đóng

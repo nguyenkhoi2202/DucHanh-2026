@@ -15,7 +15,7 @@ interface DentalFormProps {
   }) => void;
   onDelete: () => void;
   onCancel: () => void;
-  onGenerateQR: (name: string, amountStr: string) => void;
+  onGenerateQR: (amount: number, patientName: string) => void;
 }
 
 export default function DentalForm({
@@ -32,10 +32,14 @@ export default function DentalForm({
   const [visitDate, setVisitDate] = useState('');
   const [appointment, setAppointment] = useState('');
   const [plan, setPlan] = useState<PlanItem[]>([]);
-  const [moneyGenQR, setMoneyGenQR] = useState('');
+  const [qrMode, setQrMode] = useState<'remaining' | 'custom'>('remaining');
+  const [qrCustomAmount, setQrCustomAmount] = useState('');
 
-  // Default values for today
-  const getTodayStr = () => new Date().toISOString().split('T')[0];
+  // Default values for today (local date; toISOString() would give the UTC date)
+  const getTodayStr = () => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  };
 
   // Sync state with activeRecord (or defaults for new record)
   useEffect(() => {
@@ -116,6 +120,10 @@ export default function DentalForm({
   const totalCost = plan.reduce((sum, item) => sum + (parseFloat(item.cost as string) || 0), 0);
   const totalPaid = plan.reduce((sum, item) => sum + (parseFloat(item.paid as string) || 0), 0);
   const totalRemaining = totalCost - totalPaid;
+
+  // Amounts in the form are in thousands of VND; the QR needs the full amount
+  const qrAmountK = qrMode === 'remaining' ? totalRemaining : parseInt(qrCustomAmount, 10) || 0;
+  const qrAmount = qrAmountK * 1000;
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -258,9 +266,9 @@ export default function DentalForm({
                   <th className="px-3 py-2.5 text-left text-xs font-bold text-slate-700 uppercase tracking-wider w-[140px]">Ngày</th>
                   <th className="px-3 py-2.5 text-left text-xs font-bold text-slate-700 uppercase tracking-wider w-[100px]">Răng</th>
                   <th className="px-3 py-2.5 text-left text-xs font-bold text-slate-700 uppercase tracking-wider">Công tác điều trị</th>
-                  <th className="px-3 py-2.5 text-left text-xs font-bold text-slate-700 uppercase tracking-wider w-[130px]">Chi phí</th>
-                  <th className="px-3 py-2.5 text-left text-xs font-bold text-slate-700 uppercase tracking-wider w-[130px]">Đã Trả</th>
-                  <th className="px-3 py-2.5 text-left text-xs font-bold text-slate-700 uppercase tracking-wider w-[130px]">Còn lại</th>
+                  <th className="px-3 py-2.5 text-left text-xs font-bold text-slate-700 uppercase tracking-wider w-[130px]">Chi phí (k)</th>
+                  <th className="px-3 py-2.5 text-left text-xs font-bold text-slate-700 uppercase tracking-wider w-[130px]">Đã Trả (k)</th>
+                  <th className="px-3 py-2.5 text-left text-xs font-bold text-slate-700 uppercase tracking-wider w-[130px]">Còn lại (k)</th>
                   <th className="px-3 py-2.5 text-left text-xs font-bold text-slate-700 uppercase tracking-wider w-[80px]">Bác sĩ</th>
                   <th className="px-3 py-2.5 text-center text-xs font-bold text-slate-700 uppercase tracking-wider w-[50px]">Xóa</th>
                 </tr>
@@ -381,24 +389,50 @@ export default function DentalForm({
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5">
-            {/* Quick QR generation tool embedded nicely */}
-            <div className="flex items-center gap-1 bg-teal-50/50 hover:bg-teal-50 p-1.5 pl-2.5 pr-2.5 rounded-lg border border-teal-100">
-              <span className="text-[11px] font-bold text-teal-700 whitespace-nowrap">Tạo QR nhanh:</span>
-              <input
-                id="money_qr_input"
-                type="number"
-                placeholder="Số k (vd: 50)"
-                value={moneyGenQR}
-                onChange={(e) => setMoneyGenQR(e.target.value)}
-                className="w-24 bg-white border border-teal-200 rounded-md py-1 px-1.5 text-xs text-slate-700 font-mono focus:outline-none"
-              />
-              <span className="text-[10px] font-mono text-teal-600">k</span>
+            {/* QR payment: total outstanding debt, or a custom amount */}
+            <div className="flex flex-wrap items-center gap-1.5 bg-teal-50/50 p-1.5 px-2.5 rounded-lg border border-teal-100">
+              <span className="text-[11px] font-bold text-teal-700 whitespace-nowrap">Thu tiền QR:</span>
+              <div className="flex rounded-md border border-teal-200 overflow-hidden text-[11px] font-semibold">
+                <button
+                  type="button"
+                  onClick={() => setQrMode('remaining')}
+                  className={`px-2 py-1 cursor-pointer ${qrMode === 'remaining' ? 'bg-teal-600 text-white' : 'bg-white text-teal-700'}`}
+                >
+                  Còn nợ
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setQrMode('custom')}
+                  className={`px-2 py-1 cursor-pointer ${qrMode === 'custom' ? 'bg-teal-600 text-white' : 'bg-white text-teal-700'}`}
+                >
+                  Tự nhập
+                </button>
+              </div>
+              {qrMode === 'remaining' ? (
+                <span className="w-32 text-right text-xs font-mono font-bold text-slate-700">
+                  {qrAmount.toLocaleString('vi-VN')} đ
+                </span>
+              ) : (
+                <>
+                  <input
+                    id="money_qr_input"
+                    type="text"
+                    inputMode="numeric"
+                    placeholder="Số k (vd: 50)"
+                    value={qrCustomAmount}
+                    onChange={(e) => setQrCustomAmount(e.target.value.replace(/\D/g, ''))}
+                    className="w-20 bg-white border border-teal-200 rounded-md py-1 px-1.5 text-xs text-right text-slate-700 font-mono focus:outline-none"
+                  />
+                  <span className="text-[10px] font-mono text-teal-600">k = {qrAmount.toLocaleString('vi-VN')} đ</span>
+                </>
+              )}
               <button
                 id="form_qr_generation_btn"
                 type="button"
-                onClick={() => onGenerateQR(name, moneyGenQR)}
-                className="p-1 bg-teal-600 hover:bg-teal-700 text-white rounded-md transition-colors cursor-pointer"
-                title="Tạo mã QR VietQR"
+                onClick={() => onGenerateQR(qrAmount, name.trim())}
+                disabled={qrAmount < 1000}
+                className="p-1.5 bg-teal-600 hover:bg-teal-700 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-md transition-colors cursor-pointer"
+                title="Tạo mã QR thanh toán"
               >
                 <QrCode size={14} />
               </button>
