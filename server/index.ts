@@ -6,43 +6,51 @@ import path from 'node:path';
 if (fs.existsSync('.env')) process.loadEnvFile('.env');
 
 const {
+  NotFoundError,
+  authenticate,
   countRecords,
+  countUsers,
   createPaymentRequest,
   createSession,
   deleteRecord,
   deleteSession,
+  getClinic,
   getPaymentRequest,
+  getSession,
   importRecords,
-  isSessionValid,
   listRecords,
   recordBankTransaction,
   saveRecord,
+  setUser,
 } = await import('./db');
-import type { BankConfig } from '../src/types';
+import type { Session } from './db';
+import type { BankConfig, SessionInfo } from '../src/types';
 
 const PORT = Number(process.env.PORT) || 3000;
 const IS_PROD = process.env.NODE_ENV === 'production';
 const SESSION_HOURS = Number(process.env.SESSION_HOURS) || 12;
-const APP_USERNAME = process.env.APP_USERNAME || 'duchanh';
-const APP_PASSWORD = process.env.APP_PASSWORD || '';
 const SEPAY_API_KEY = process.env.SEPAY_API_KEY || '';
 
+// Bank account shown on QR codes (only clinics with QR enabled use it)
 const bankConfig: BankConfig = {
-  bankCode: process.env.BANK_CODE || '970441',
-  bankName: process.env.BANK_NAME || 'VIB',
-  accountNo: process.env.BANK_ACCOUNT_NO || '888974974',
-  accountName: process.env.BANK_ACCOUNT_NAME || 'TRAN THI HA MY',
+  bankCode: process.env.BANK_CODE || '970403',
+  bankName: process.env.BANK_NAME || 'Sacombank',
+  accountNo: process.env.BANK_ACCOUNT_NO || '',
+  accountName: process.env.BANK_ACCOUNT_NAME || '',
   sepayEnabled: !!SEPAY_API_KEY,
 };
 
-if (!APP_PASSWORD) {
-  console.error('Thiếu APP_PASSWORD trong file .env — xem .env.example');
-  process.exit(1);
-}
-
-if (IS_PROD && APP_PASSWORD.length < 8) {
-  console.error('APP_PASSWORD phải có ít nhất 8 ký tự khi chạy thật (máy chủ mở ra Internet cho SePay).');
-  process.exit(1);
+// First start: create the Bình Thuận login from .env so the existing setup keeps working.
+// Further accounts are managed with: node dist-server/user.js (see README)
+if (countUsers() === 0) {
+  const username = process.env.APP_USERNAME || 'duchanh';
+  const password = process.env.APP_PASSWORD || '';
+  if (password.length < (IS_PROD ? 8 : 1)) {
+    console.error('Chưa có tài khoản nào: đặt APP_USERNAME / APP_PASSWORD (≥ 8 ký tự) trong .env để tạo tài khoản đầu tiên.');
+    process.exit(1);
+  }
+  setUser(username, password, 'binh-thuan');
+  console.log(`Đã tạo tài khoản "${username}" cho Nha Khoa Bình Thuận`);
 }
 
 const app = express();
@@ -55,16 +63,18 @@ app.use(express.json({ limit: '20mb' }));
 // REALTIME SYNC (Server-Sent Events)
 // ==========================================
 // Every open browser tab keeps one connection here; after any change the
-// server pushes an event and the tabs reload the data they show.
-const sseClients = new Set<Response>();
+// server pushes an event to the tabs of that clinic, which reload their data.
+const sseClients = new Map<Response, number>(); // connection -> clinic id
 
-function broadcast(event: string, data: unknown = {}) {
+function broadcast(clinicId: number, event: string, data: unknown = {}) {
   const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const res of sseClients) res.write(msg);
+  for (const [res, clientClinic] of sseClients) {
+    if (clientClinic === clinicId) res.write(msg);
+  }
 }
 
 setInterval(() => {
-  for (const res of sseClients) res.write(': ping\n\n');
+  for (const res of sseClients.keys()) res.write(': ping\n\n');
 }, 25_000);
 
 // ==========================================
@@ -87,10 +97,20 @@ function safeEqual(a: string, b: string): boolean {
   return crypto.timingSafeEqual(ha, hb);
 }
 
-function requireAuth(req: Request, res: Response, next: NextFunction) {
+function currentSession(req: Request): Session | undefined {
   const token = readCookie(req, SESSION_COOKIE);
-  if (token && isSessionValid(token)) return next();
-  res.status(401).json({ error: 'Phiên đăng nhập đã hết hạn' });
+  return token ? getSession(token) : undefined;
+}
+
+function requireAuth(req: Request, res: Response, next: NextFunction) {
+  const session = currentSession(req);
+  if (!session) return res.status(401).json({ error: 'Phiên đăng nhập đã hết hạn' });
+  res.locals.session = session;
+  next();
+}
+
+function clinicOf(res: Response): number {
+  return (res.locals.session as Session).clinicId;
 }
 
 // Simple brute-force guard: 10 failed logins per IP per 15 minutes
@@ -106,10 +126,8 @@ app.post('/api/login', (req, res) => {
   }
 
   const { username, password } = req.body ?? {};
-  const ok =
-    safeEqual(String(username ?? '').trim(), APP_USERNAME) &&
-    safeEqual(String(password ?? '').trim(), APP_PASSWORD);
-  if (!ok) {
+  const userId = authenticate(String(username ?? ''), String(password ?? '').trim());
+  if (!userId) {
     const fresh = !attempts || attempts.resetAt <= now;
     failedLogins.set(ip, { count: fresh ? 1 : attempts.count + 1, resetAt: fresh ? now + LOGIN_WINDOW_MS : attempts.resetAt });
     return res.status(401).json({ error: 'Sai tài khoản hoặc mật khẩu' });
@@ -118,7 +136,7 @@ app.post('/api/login', (req, res) => {
 
   const token = crypto.randomBytes(32).toString('hex');
   const maxAge = SESSION_HOURS * 3600 * 1000;
-  createSession(token, Date.now() + maxAge);
+  createSession(token, userId, Date.now() + maxAge);
   // secure only over HTTPS, so logging in over plain http://<LAN-IP>:3000 still works
   res.cookie(SESSION_COOKIE, token, { httpOnly: true, sameSite: 'strict', secure: req.secure, maxAge });
   res.json({ ok: true });
@@ -132,9 +150,15 @@ app.post('/api/logout', (req, res) => {
 });
 
 app.get('/api/me', (req, res) => {
-  const token = readCookie(req, SESSION_COOKIE);
-  if (!token || !isSessionValid(token)) return res.json({ loggedIn: false });
-  res.json({ loggedIn: true, config: bankConfig });
+  const session = currentSession(req);
+  const clinic = session && getClinic(session.clinicId);
+  if (!session || !clinic) return res.json({ loggedIn: false });
+  const info: SessionInfo = {
+    username: session.username,
+    clinic,
+    bank: clinic.qrEnabled ? bankConfig : null,
+  };
+  res.json({ loggedIn: true, ...info });
 });
 
 // ==========================================
@@ -152,12 +176,12 @@ app.post('/api/sepay/webhook', (req, res) => {
   }
 
   const paid = recordBankTransaction(body);
-  if (paid) broadcast('payment', paid);
+  if (paid) broadcast(paid.clinicId, 'payment', paid);
   res.json({ success: true });
 });
 
 // ==========================================
-// RECORDS API (everything below requires login)
+// RECORDS API (everything below requires login, scoped to the user's clinic)
 // ==========================================
 app.use('/api', requireAuth);
 
@@ -168,59 +192,68 @@ app.get('/api/events', (req, res) => {
     Connection: 'keep-alive',
   });
   res.write(': connected\n\n');
-  sseClients.add(res);
+  sseClients.set(res, clinicOf(res));
   req.on('close', () => sseClients.delete(res));
 });
 
 app.get('/api/records', (_req, res) => {
-  res.json(listRecords());
+  res.json(listRecords(clinicOf(res)));
 });
+
+function sendSaveError(res: Response, err: unknown) {
+  res.status(err instanceof NotFoundError ? 404 : 400).json({ error: (err as Error).message });
+}
 
 app.post('/api/records', (req, res) => {
   try {
-    const record = saveRecord(req.body);
-    broadcast('records');
+    const record = saveRecord(clinicOf(res), req.body);
+    broadcast(clinicOf(res), 'records');
     res.status(201).json(record);
   } catch (err) {
-    res.status(400).json({ error: (err as Error).message });
+    sendSaveError(res, err);
   }
 });
 
 app.put('/api/records/:id', (req, res) => {
   try {
-    const record = saveRecord(req.body, Number(req.params.id));
-    broadcast('records');
+    const record = saveRecord(clinicOf(res), req.body, Number(req.params.id));
+    broadcast(clinicOf(res), 'records');
     res.json(record);
   } catch (err) {
-    res.status(400).json({ error: (err as Error).message });
+    sendSaveError(res, err);
   }
 });
 
 app.delete('/api/records/:id', (req, res) => {
-  if (!deleteRecord(Number(req.params.id))) return res.status(404).json({ error: 'Không tìm thấy hồ sơ' });
-  broadcast('records');
+  if (!deleteRecord(clinicOf(res), Number(req.params.id))) {
+    return res.status(404).json({ error: 'Không tìm thấy hồ sơ' });
+  }
+  broadcast(clinicOf(res), 'records');
   res.json({ ok: true });
 });
 
 app.post('/api/records/import', (req, res) => {
   if (!Array.isArray(req.body)) return res.status(400).json({ error: 'File backup phải là một mảng hồ sơ' });
-  const imported = importRecords(req.body);
-  broadcast('records');
-  res.json({ imported, total: countRecords() });
+  const imported = importRecords(clinicOf(res), req.body);
+  broadcast(clinicOf(res), 'records');
+  res.json({ imported, total: countRecords(clinicOf(res)) });
 });
 
 app.post('/api/payment-requests', (req, res) => {
+  if (!getClinic(clinicOf(res))?.qrEnabled) {
+    return res.status(403).json({ error: 'Nha khoa này không dùng chức năng thanh toán QR' });
+  }
   const amount = Math.round(Number(req.body?.amount));
   if (!Number.isFinite(amount) || amount < 1000) {
     return res.status(400).json({ error: 'Số tiền phải từ 1.000 VND trở lên' });
   }
   const patientId = Number(req.body?.patientId) || null;
   const code = 'DH' + crypto.randomBytes(5).toString('hex').toUpperCase();
-  res.status(201).json(createPaymentRequest(code, amount, patientId));
+  res.status(201).json(createPaymentRequest(clinicOf(res), code, amount, patientId));
 });
 
 app.get('/api/payment-requests/:id', (req, res) => {
-  const request = getPaymentRequest(Number(req.params.id));
+  const request = getPaymentRequest(Number(req.params.id), clinicOf(res));
   if (!request) return res.status(404).json({ error: 'Không tìm thấy yêu cầu thanh toán' });
   res.json(request);
 });

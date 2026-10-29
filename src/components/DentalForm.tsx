@@ -15,7 +15,7 @@ interface DentalFormProps {
   }) => void;
   onDelete: () => void;
   onCancel: () => void;
-  onGenerateQR: (amount: number, patientName: string) => void;
+  onGenerateQR?: (amount: number, patientName: string) => void; // omitted when the clinic has no QR payments
 }
 
 export default function DentalForm({
@@ -390,6 +390,7 @@ export default function DentalForm({
 
           <div className="flex flex-wrap items-center gap-2.5">
             {/* QR payment: total outstanding debt, or a custom amount */}
+            {onGenerateQR && (
             <div className="flex flex-wrap items-center gap-1.5 bg-teal-50/50 p-1.5 px-2.5 rounded-lg border border-teal-100">
               <span className="text-[11px] font-bold text-teal-700 whitespace-nowrap">Thu tiền QR:</span>
               <div className="flex rounded-md border border-teal-200 overflow-hidden text-[11px] font-semibold">
@@ -437,6 +438,7 @@ export default function DentalForm({
                 <QrCode size={14} />
               </button>
             </div>
+            )}
 
             {activeRecord && (
               <button

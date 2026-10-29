@@ -1,7 +1,8 @@
 import { DatabaseSync } from 'node:sqlite';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { DentalRecord, PlanItem, PaymentRequest } from '../src/types';
+import type { ClinicInfo, DentalRecord, PlanItem, PaymentRequest } from '../src/types';
 
 const DB_PATH = process.env.DB_PATH || path.resolve(process.cwd(), 'data', 'duchanh.db');
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
@@ -11,6 +12,22 @@ export const db = new DatabaseSync(DB_PATH);
 db.exec(`
   PRAGMA journal_mode = WAL;
   PRAGMA foreign_keys = ON;
+
+  -- Each clinic only ever sees its own patients and payments
+  CREATE TABLE IF NOT EXISTS clinics (
+    id         INTEGER PRIMARY KEY,
+    slug       TEXT NOT NULL UNIQUE,
+    name       TEXT NOT NULL,
+    hotlines   TEXT NOT NULL DEFAULT '[]',  -- JSON: [{"label": "...", "phone": "..."}]
+    qr_enabled INTEGER NOT NULL DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash TEXT NOT NULL,
+    clinic_id     INTEGER NOT NULL REFERENCES clinics(id)
+  );
 
   CREATE TABLE IF NOT EXISTS patients (
     id          INTEGER PRIMARY KEY,
@@ -43,6 +60,7 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS sessions (
     token      TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     expires_at INTEGER NOT NULL
   );
 
@@ -72,11 +90,54 @@ db.exec(`
   );
 `);
 
-// Databases created before the remaining column existed
-const treatmentColumns = db.prepare('PRAGMA table_info(treatments)').all() as { name: string }[];
-if (!treatmentColumns.some((c) => c.name === 'remaining')) {
+// ==========================================
+// MIGRATIONS for databases created by earlier versions
+// ==========================================
+function hasColumn(table: string, column: string): boolean {
+  return (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).some((c) => c.name === column);
+}
+
+if (!hasColumn('treatments', 'remaining')) {
   db.exec('ALTER TABLE treatments ADD COLUMN remaining INTEGER NOT NULL DEFAULT 0');
 }
+
+// Single-clinic version: sessions had no user; recreate (everyone logs in again once)
+if (!hasColumn('sessions', 'user_id')) {
+  db.exec(`
+    DROP TABLE sessions;
+    CREATE TABLE sessions (
+      token      TEXT PRIMARY KEY,
+      user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      expires_at INTEGER NOT NULL
+    );
+  `);
+}
+
+const BINH_THUAN_ID = 1;
+const CU_BAO_ID = 2;
+db.prepare(`INSERT OR IGNORE INTO clinics (id, slug, name, hotlines, qr_enabled) VALUES (?, ?, ?, ?, ?)`).run(
+  BINH_THUAN_ID, 'binh-thuan', 'Nha Khoa Bình Thuận',
+  JSON.stringify([
+    { label: 'Đức Hạnh', phone: '0947 137 139' },
+    { label: 'Hà My', phone: '0888 974 974' },
+  ]),
+  1,
+);
+db.prepare(`INSERT OR IGNORE INTO clinics (id, slug, name, hotlines, qr_enabled) VALUES (?, ?, ?, ?, ?)`).run(
+  CU_BAO_ID, 'cu-bao', 'Nha Khoa Cư Bao', '[]', 0,
+);
+
+// Everything that existed before multi-clinic support belongs to Bình Thuận.
+// SQLite only allows adding a REFERENCES column with a non-NULL default while
+// foreign key enforcement is off, so switch it off just for these statements.
+for (const table of ['patients', 'payment_requests']) {
+  if (!hasColumn(table, 'clinic_id')) {
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.exec(`ALTER TABLE ${table} ADD COLUMN clinic_id INTEGER NOT NULL DEFAULT ${BINH_THUAN_ID} REFERENCES clinics(id)`);
+    db.exec('PRAGMA foreign_keys = ON');
+  }
+}
+db.exec('CREATE INDEX IF NOT EXISTS idx_patients_clinic ON patients(clinic_id)');
 
 // Amounts are stored the way the clinic types them: in thousands of VND ("220" = 220.000đ).
 function toInt(v: unknown): number {
@@ -112,11 +173,15 @@ function rowToPlan(t: TreatmentRow): PlanItem {
   };
 }
 
-export function listRecords(): DentalRecord[] {
-  const patients = db.prepare('SELECT * FROM patients ORDER BY id').all() as PatientRow[];
+function loadRecords(where: string, ...params: number[]): DentalRecord[] {
+  const patients = db.prepare(`SELECT * FROM patients WHERE ${where} ORDER BY id`).all(...params) as PatientRow[];
   const treatments = db
-    .prepare('SELECT * FROM treatments ORDER BY patient_id, position')
-    .all() as TreatmentRow[];
+    .prepare(`
+      SELECT t.* FROM treatments t JOIN patients p ON p.id = t.patient_id
+      WHERE ${where.replace(/\b(clinic_id|id)\b/g, 'p.$1')}
+      ORDER BY t.patient_id, t.position
+    `)
+    .all(...params) as TreatmentRow[];
 
   const plansByPatient = new Map<number, PlanItem[]>();
   for (const t of treatments) {
@@ -137,17 +202,27 @@ export function listRecords(): DentalRecord[] {
   }));
 }
 
-export function getRecord(id: number): DentalRecord | undefined {
-  return listRecords().find((r) => r.id === id);
+export function listRecords(clinicId: number): DentalRecord[] {
+  return loadRecords('clinic_id = ?', clinicId);
+}
+
+export function getRecord(clinicId: number, id: number): DentalRecord | undefined {
+  return loadRecords('clinic_id = ? AND id = ?', clinicId, id)[0];
+}
+
+function patientClinic(id: number): number | undefined {
+  const row = db.prepare('SELECT clinic_id FROM patients WHERE id = ?').get(id) as { clinic_id: number } | undefined;
+  return row?.clinic_id;
 }
 
 const insertPatient = db.prepare(`
-  INSERT INTO patients (id, name, phone, address, age, visit_date, appointment, created_at, updated_at)
-  VALUES (:id, :name, :phone, :address, :age, :visit_date, :appointment, :now, :now)
+  INSERT INTO patients (id, clinic_id, name, phone, address, age, visit_date, appointment, created_at, updated_at)
+  VALUES (:id, :clinic_id, :name, :phone, :address, :age, :visit_date, :appointment, :now, :now)
   ON CONFLICT(id) DO UPDATE SET
     name = excluded.name, phone = excluded.phone, address = excluded.address,
     age = excluded.age, visit_date = excluded.visit_date,
     appointment = excluded.appointment, updated_at = excluded.updated_at
+  WHERE patients.clinic_id = excluded.clinic_id
 `);
 const deleteTreatments = db.prepare('DELETE FROM treatments WHERE patient_id = ?');
 const insertTreatment = db.prepare(`
@@ -155,9 +230,10 @@ const insertTreatment = db.prepare(`
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
-function writeRecord(input: Partial<DentalRecord>, id: number) {
+function writeRecord(clinicId: number, input: Partial<DentalRecord>, id: number) {
   insertPatient.run({
     id,
+    clinic_id: clinicId,
     name: str(input.name),
     phone: str(input.phone),
     address: str(input.address),
@@ -191,26 +267,32 @@ function transaction<T>(fn: () => T): T {
   }
 }
 
-export function saveRecord(input: Partial<DentalRecord>, id?: number): DentalRecord {
+export class NotFoundError extends Error {}
+
+export function saveRecord(clinicId: number, input: Partial<DentalRecord>, id?: number): DentalRecord {
   if (!str(input.name)) throw new Error('Thiếu họ tên bệnh nhân');
+  if (id !== undefined && patientClinic(id) !== clinicId) throw new NotFoundError('Không tìm thấy hồ sơ');
   const recordId = id ?? nextPatientId();
-  transaction(() => writeRecord(input, recordId));
-  return getRecord(recordId)!;
+  transaction(() => writeRecord(clinicId, input, recordId));
+  return getRecord(clinicId, recordId)!;
 }
 
-export function deleteRecord(id: number): boolean {
-  return db.prepare('DELETE FROM patients WHERE id = ?').run(id).changes > 0;
+export function deleteRecord(clinicId: number, id: number): boolean {
+  return db.prepare('DELETE FROM patients WHERE id = ? AND clinic_id = ?').run(id, clinicId).changes > 0;
 }
 
 // Imports legacy JSON backups (same shape as the old localStorage data).
 // Records are upserted by id, so importing the same file twice is harmless.
-export function importRecords(records: Partial<DentalRecord>[]): number {
+// An id already used by the other clinic gets a fresh id instead of overwriting it.
+export function importRecords(clinicId: number, records: Partial<DentalRecord>[]): number {
   return transaction(() => {
     let count = 0;
     for (const rec of records) {
       if (!str(rec.name)) continue;
-      const id = Number(rec.id) > 0 ? Number(rec.id) : nextPatientId();
-      writeRecord(rec, id);
+      let id = Number(rec.id) > 0 ? Number(rec.id) : nextPatientId();
+      const owner = patientClinic(id);
+      if (owner !== undefined && owner !== clinicId) id = nextPatientId();
+      writeRecord(clinicId, rec, id);
       count++;
     }
     return count;
@@ -223,23 +305,98 @@ function nextPatientId(): number {
   return Math.max(Date.now(), (row.maxId ?? 0) + 1);
 }
 
-export function countRecords(): number {
-  return (db.prepare('SELECT COUNT(*) AS c FROM patients').get() as { c: number }).c;
+export function countRecords(clinicId?: number): number {
+  const row = clinicId === undefined
+    ? db.prepare('SELECT COUNT(*) AS c FROM patients').get()
+    : db.prepare('SELECT COUNT(*) AS c FROM patients WHERE clinic_id = ?').get(clinicId);
+  return (row as { c: number }).c;
+}
+
+// ==========================================
+// CLINICS & USERS
+// ==========================================
+type ClinicRow = { id: number; slug: string; name: string; hotlines: string; qr_enabled: number };
+
+function rowToClinic(r: ClinicRow): ClinicInfo {
+  return { id: r.id, slug: r.slug, name: r.name, hotlines: JSON.parse(r.hotlines), qrEnabled: !!r.qr_enabled };
+}
+
+export function getClinic(id: number): ClinicInfo | undefined {
+  const row = db.prepare('SELECT * FROM clinics WHERE id = ?').get(id) as ClinicRow | undefined;
+  return row && rowToClinic(row);
+}
+
+export function listClinics(): ClinicInfo[] {
+  return (db.prepare('SELECT * FROM clinics ORDER BY id').all() as ClinicRow[]).map(rowToClinic);
+}
+
+function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16);
+  const hash = crypto.scryptSync(password, salt, 32);
+  return `scrypt$${salt.toString('hex')}$${hash.toString('hex')}`;
+}
+
+function verifyPassword(password: string, stored: string): boolean {
+  const [scheme, saltHex, hashHex] = stored.split('$');
+  if (scheme !== 'scrypt') return false;
+  const expected = Buffer.from(hashHex, 'hex');
+  const actual = crypto.scryptSync(password, Buffer.from(saltHex, 'hex'), expected.length);
+  return crypto.timingSafeEqual(actual, expected);
+}
+
+export function countUsers(): number {
+  return (db.prepare('SELECT COUNT(*) AS c FROM users').get() as { c: number }).c;
+}
+
+/** Creates the user, or changes its password and clinic if it already exists. */
+export function setUser(username: string, password: string, clinicSlug: string) {
+  const clinic = db.prepare('SELECT id FROM clinics WHERE slug = ?').get(clinicSlug) as { id: number } | undefined;
+  if (!clinic) throw new Error(`Không có nha khoa "${clinicSlug}"`);
+  db.prepare(`
+    INSERT INTO users (username, password_hash, clinic_id) VALUES (?, ?, ?)
+    ON CONFLICT(username) DO UPDATE SET password_hash = excluded.password_hash, clinic_id = excluded.clinic_id
+  `).run(username.trim(), hashPassword(password), clinic.id);
+  // Changing a password logs that account out everywhere
+  db.prepare('DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE username = ?)').run(username.trim());
+}
+
+export function listUsers(): { username: string; clinic: string }[] {
+  return db
+    .prepare('SELECT u.username, c.name AS clinic FROM users u JOIN clinics c ON c.id = u.clinic_id ORDER BY c.id, u.username')
+    .all() as { username: string; clinic: string }[];
+}
+
+/** Returns the user id when the credentials are right. */
+export function authenticate(username: string, password: string): number | undefined {
+  const row = db.prepare('SELECT id, password_hash FROM users WHERE username = ?').get(username.trim()) as
+    | { id: number; password_hash: string }
+    | undefined;
+  // Hash anyway on unknown users so timing does not reveal which usernames exist
+  const ok = verifyPassword(password, row?.password_hash ?? hashPassword('dummy'));
+  return row && ok ? row.id : undefined;
 }
 
 // ==========================================
 // SESSIONS
 // ==========================================
-export function createSession(token: string, expiresAt: number) {
+export function createSession(token: string, userId: number, expiresAt: number) {
   db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(Date.now());
-  db.prepare('INSERT INTO sessions (token, expires_at) VALUES (?, ?)').run(token, expiresAt);
+  db.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)').run(token, userId, expiresAt);
 }
 
-export function isSessionValid(token: string): boolean {
-  const row = db.prepare('SELECT expires_at FROM sessions WHERE token = ?').get(token) as
-    | { expires_at: number }
-    | undefined;
-  return !!row && row.expires_at > Date.now();
+export interface Session {
+  username: string;
+  clinicId: number;
+}
+
+export function getSession(token: string): Session | undefined {
+  const row = db
+    .prepare(`
+      SELECT u.username, u.clinic_id FROM sessions s JOIN users u ON u.id = s.user_id
+      WHERE s.token = ? AND s.expires_at > ?
+    `)
+    .get(token, Date.now()) as { username: string; clinic_id: number } | undefined;
+  return row && { username: row.username, clinicId: row.clinic_id };
 }
 
 export function deleteSession(token: string) {
@@ -250,7 +407,7 @@ export function deleteSession(token: string) {
 // PAYMENTS (SePay)
 // ==========================================
 type PaymentRequestRow = {
-  id: number; code: string; patient_id: number | null; amount: number;
+  id: number; code: string; clinic_id: number; patient_id: number | null; amount: number;
   status: 'pending' | 'paid'; created_at: number; paid_at: number | null;
   patient_name?: string | null; paid_amount?: number | null; bank_reference?: string | null;
 };
@@ -259,6 +416,7 @@ function rowToRequest(r: PaymentRequestRow): PaymentRequest {
   return {
     id: r.id,
     code: r.code,
+    clinicId: r.clinic_id,
     patientId: r.patient_id,
     patientName: r.patient_name ?? null,
     amount: r.amount,
@@ -270,14 +428,18 @@ function rowToRequest(r: PaymentRequestRow): PaymentRequest {
   };
 }
 
-export function createPaymentRequest(code: string, amount: number, patientId: number | null): PaymentRequest {
+export function createPaymentRequest(
+  clinicId: number, code: string, amount: number, patientId: number | null,
+): PaymentRequest {
+  // Only link patients of the same clinic
+  const linkedPatient = patientId !== null && patientClinic(patientId) === clinicId ? patientId : null;
   const info = db
-    .prepare('INSERT INTO payment_requests (code, patient_id, amount, created_at) VALUES (?, ?, ?, ?)')
-    .run(code, patientId, amount, Date.now());
+    .prepare('INSERT INTO payment_requests (code, clinic_id, patient_id, amount, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(code, clinicId, linkedPatient, amount, Date.now());
   return getPaymentRequest(Number(info.lastInsertRowid))!;
 }
 
-export function getPaymentRequest(id: number): PaymentRequest | undefined {
+export function getPaymentRequest(id: number, clinicId?: number): PaymentRequest | undefined {
   const row = db
     .prepare(`
       SELECT r.*, p.name AS patient_name,
@@ -288,7 +450,8 @@ export function getPaymentRequest(id: number): PaymentRequest | undefined {
       WHERE r.id = ?
     `)
     .get(id) as PaymentRequestRow | undefined;
-  return row && rowToRequest(row);
+  if (!row || (clinicId !== undefined && row.clinic_id !== clinicId)) return undefined;
+  return rowToRequest(row);
 }
 
 export interface SepayWebhookBody {

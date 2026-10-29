@@ -36,7 +36,7 @@ export default function Login({ onLoginSuccess }: LoginProps) {
             <Heart className="w-10 h-10 fill-teal-600" />
           </div>
           <h2 className="text-2xl font-bold text-slate-800 tracking-tight text-center">
-            Nha Khoa Đức Hạnh
+            Quản Lý Hồ Sơ Nha Khoa
           </h2>
           <p className="text-sm text-slate-500 mt-1">Đăng nhập hệ thống quản lý hồ sơ</p>
         </div>
@@ -107,7 +107,7 @@ export default function Login({ onLoginSuccess }: LoginProps) {
         </form>
 
         <div className="mt-8 text-center border-t border-slate-100 pt-4 text-xs text-slate-400">
-          Hệ Thống Nha Khoa Đức Hạnh Bình Thuận &copy; 2026
+          Nha Khoa Bình Thuận · Nha Khoa Cư Bao &copy; 2026
         </div>
       </div>
     </div>

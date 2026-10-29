@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { api, UnauthorizedError } from './api';
-import { BankConfig, DentalRecord, DentalRecordInput, PaymentRequest, PlanItem } from './types';
+import { DentalRecord, DentalRecordInput, PaymentRequest, PlanItem, SessionInfo } from './types';
 
 // Subcomponents
 import Login from './components/Login';
@@ -60,7 +60,7 @@ function downloadJSON(data: unknown, filename: string) {
 export default function App() {
   // 1. Session tracking states
   const [authState, setAuthState] = useState<'checking' | 'out' | 'in'>('checking');
-  const [bankConfig, setBankConfig] = useState<BankConfig | null>(null);
+  const [session, setSession] = useState<SessionInfo | null>(null);
 
   // 2. Core dental record states
   const [records, setRecords] = useState<DentalRecord[]>([]);
@@ -114,8 +114,8 @@ export default function App() {
   useEffect(() => {
     api
       .me()
-      .then((config) => {
-        setBankConfig(config);
+      .then((info) => {
+        setSession(info);
         setAuthState('in');
       })
       .catch(() => setAuthState('out'));
@@ -193,7 +193,7 @@ export default function App() {
   // ==========================================
   async function handleLoginSuccess() {
     try {
-      setBankConfig(await api.me());
+      setSession(await api.me());
       setAuthState('in');
     } catch (err) {
       handleApiError(err, 'Không lấy được cấu hình');
@@ -204,6 +204,7 @@ export default function App() {
     await api.logout().catch(() => {});
     setRecords([]);
     setActiveRecord(null);
+    setSession(null);
     setAuthState('out');
   }
 
@@ -381,6 +382,12 @@ export default function App() {
     setPaidPayment((current) => (current && current.id === paid.id ? current : paid));
   }, []);
 
+  const clinic = session?.clinic;
+
+  useEffect(() => {
+    document.title = clinic ? `${clinic.name} | Quản Lý Hồ Sơ Bệnh Nhân` : 'Quản Lý Hồ Sơ Nha Khoa';
+  }, [clinic]);
+
   // Main Authentication Guardian
   if (authState === 'checking') {
     return (
@@ -421,15 +428,16 @@ export default function App() {
             </div>
             <div>
               <h1 className="text-xl md:text-3xl font-black text-slate-800 tracking-tight leading-none mb-1">
-                Nha Khoa Đức Hạnh Bình Thuận
+                {clinic?.name}
               </h1>
               <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500 font-medium">
-                <span className="flex items-center gap-1">
-                  <Phone size={12} className="text-[#007bff]" /> Hot-line: <span className="text-slate-700 font-bold">0947 137 139 (Đức Hạnh)</span>
-                </span>
-                <span className="flex items-center gap-1">
-                  <Phone size={12} className="text-[#007bff]" /> Hot-line: <span className="text-slate-700 font-bold">0888 974 974 (Hà My)</span>
-                </span>
+                {clinic?.hotlines.map((h) => (
+                  <span key={h.phone} className="flex items-center gap-1">
+                    <Phone size={12} className="text-[#007bff]" /> Hot-line:{' '}
+                    <span className="text-slate-700 font-bold">{h.phone} ({h.label})</span>
+                  </span>
+                ))}
+                <span className="text-slate-400">Đăng nhập: {session?.username}</span>
               </div>
             </div>
           </div>
@@ -507,7 +515,7 @@ export default function App() {
             onSubmit={handleSaveRecord}
             onDelete={handleDeleteActiveRecord}
             onCancel={handleCancelEdit}
-            onGenerateQR={handleGenerateQR}
+            onGenerateQR={session?.bank ? handleGenerateQR : undefined}
           />
         </section>
 
@@ -556,7 +564,7 @@ export default function App() {
       {/* Clean high contrast Copyright Footer */}
       <footer className="bg-slate-900 text-slate-400 py-6 mt-12 text-center text-xs">
         <div className="max-w-7xl mx-auto px-4 flex flex-col md:flex-row items-center justify-between gap-4">
-          <p>© Copyright 2026 Nha Khoa Đức Hạnh Bình Thuận. Bản quyền thuộc về KhoiTN.</p>
+          <p>© Copyright 2026 {clinic?.name}. Bản quyền thuộc về KhoiTN.</p>
           <div className="flex items-center gap-3 text-slate-500">
             <span>Thiết kế đáp ứng bởi KhoiTN</span>
             <span>•</span>
@@ -597,7 +605,7 @@ export default function App() {
           ========================================== */}
       <VietQRPopup
         request={paymentRequest}
-        config={bankConfig}
+        config={session?.bank ?? null}
         patientName={qrPatientName}
         onClose={() => setPaymentRequest(null)}
         onPaid={handlePaid}

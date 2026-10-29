@@ -16,6 +16,18 @@ import {
   Sparkles
 } from 'lucide-react';
 
+// "Nguyễn Văn Đức" -> "nguyen van duc", so searches work with or without diacritics
+function foldVietnamese(text: string): string {
+  return text
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 interface DentalRecordsTableProps {
   records: DentalRecord[];
   onEdit: (record: DentalRecord, index: number) => void;
@@ -37,9 +49,10 @@ export default function DentalRecordsTable({ records, onEdit }: DentalRecordsTab
   const filteredRecords = records.filter((rec) => {
     // 1. Text Search (phone or name)
     if (searchPhoneOrName) {
-      const query = searchPhoneOrName.toLowerCase();
-      const matchPhone = rec.phone.toLowerCase().includes(query);
-      const matchName = rec.name.toLowerCase().includes(query);
+      const query = foldVietnamese(searchPhoneOrName);
+      const queryDigits = searchPhoneOrName.replace(/\D/g, '');
+      const matchPhone = queryDigits !== '' && (rec.phone || '').replace(/\D/g, '').includes(queryDigits);
+      const matchName = foldVietnamese(rec.name || '').includes(query);
       if (!matchPhone && !matchName) return false;
     }
 

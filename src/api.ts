@@ -1,4 +1,4 @@
-import type { BankConfig, DentalRecord, DentalRecordInput, PaymentRequest } from './types';
+import type { BankConfig, DentalRecord, DentalRecordInput, PaymentRequest, SessionInfo } from './types';
 
 export class UnauthorizedError extends Error {}
 
@@ -19,9 +19,9 @@ export const api = {
     request<{ ok: true }>('/api/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
   logout: () => request<{ ok: true }>('/api/logout', { method: 'POST' }),
   me: async () => {
-    const res = await request<{ loggedIn: boolean; config?: BankConfig }>('/api/me');
-    if (!res.loggedIn || !res.config) throw new UnauthorizedError('Chưa đăng nhập');
-    return res.config;
+    const res = await request<{ loggedIn: boolean } & Partial<SessionInfo>>('/api/me');
+    if (!res.loggedIn || !res.clinic) throw new UnauthorizedError('Chưa đăng nhập');
+    return { username: res.username!, clinic: res.clinic, bank: res.bank ?? null };
   },
 
   listRecords: () => request<DentalRecord[]>('/api/records'),

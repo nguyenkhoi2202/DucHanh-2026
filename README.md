@@ -48,6 +48,26 @@ gunzip -c ~/duchanh-backups/duchanh-<ngày-giờ>.db.gz > data/duchanh.db && rm 
 docker compose start app
 ```
 
+## Nhiều nha khoa & tài khoản
+
+Một hệ thống phục vụ 2 nha khoa; mỗi tài khoản thuộc một nha khoa và chỉ thấy bệnh nhân của nha khoa đó.
+
+| Nha khoa | Mã (slug) | Thanh toán QR |
+|---|---|---|
+| Nha Khoa Bình Thuận | `binh-thuan` | Có (SePay) |
+| Nha Khoa Cư Bao | `cu-bao` | Không |
+
+Quản lý tài khoản (mật khẩu ≥ 8 ký tự; đổi mật khẩu sẽ đăng xuất tài khoản đó trên mọi máy):
+
+```bash
+# Trên server (trong container)
+docker exec duchanh-app node dist-server/user.js list
+docker exec duchanh-app node dist-server/user.js set <tên-đăng-nhập> <mật-khẩu> <binh-thuan|cu-bao>
+
+# Khi chạy thử trên máy
+npm run user -- list
+```
+
 ## Dữ liệu
 
 - Toàn bộ dữ liệu nằm trong file `data/duchanh.db`. **Sao lưu file này định kỳ** (copy khi đang chạy vẫn được,
