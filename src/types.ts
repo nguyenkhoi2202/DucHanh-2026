@@ -31,8 +31,16 @@ export interface PaymentRequest {
   status: 'pending' | 'paid';
   createdAt: number;
   paidAt: number | null;
+  recordedAt: number | null; // written into the patient's treatment log
   paidAmount: number | null; // what the bank actually received (can exceed amount)
   bankReference: string | null;
+}
+
+export interface ServiceItem {
+  id: number;
+  name: string;
+  price: number; // thousands of VND
+  active: boolean; // inactive services are kept but not suggested in the form
 }
 
 export interface ClinicInfo {

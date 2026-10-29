@@ -40,6 +40,11 @@ if [ "$WITH_DB" = "--with-db" ]; then
   rm -f "$SNAPSHOT"
 fi
 
+if ssh "$TARGET" "docker ps -q -f name=^duchanh-app\$ | grep -q ."; then
+  echo "==> Sao lưu DB trên server trước khi cập nhật (bản mới có thể nâng cấp cấu trúc DB)"
+  ssh "$TARGET" "$REMOTE_DIR/scripts/backup-db.sh"
+fi
+
 echo "==> Build và chạy trên server"
 ssh "$TARGET" "cd $REMOTE_DIR && \
   docker run --rm -v \"\$PWD/data:/d\" -v \"\$PWD/cloudflared:/c\" node:24-bookworm-slim \

@@ -11,6 +11,10 @@ const {
   countRecords,
   countUsers,
   createPaymentRequest,
+  createServices,
+  deleteService,
+  listServices,
+  updateService,
   createSession,
   deleteRecord,
   deleteSession,
@@ -20,8 +24,10 @@ const {
   importRecords,
   listRecords,
   recordBankTransaction,
+  recordPaymentToLog,
   saveRecord,
   setUser,
+  snapshotDatabase,
 } = await import('./db');
 import type { Session } from './db';
 import type { BankConfig, SessionInfo } from '../src/types';
@@ -64,17 +70,31 @@ app.use(express.json({ limit: '20mb' }));
 // ==========================================
 // Every open browser tab keeps one connection here; after any change the
 // server pushes an event to the tabs of that clinic, which reload their data.
-const sseClients = new Map<Response, number>(); // connection -> clinic id
+const sseClients = new Map<Response, { clinicId: number; token: string }>();
 
 function broadcast(clinicId: number, event: string, data: unknown = {}) {
   const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const [res, clientClinic] of sseClients) {
-    if (clientClinic === clinicId) res.write(msg);
+  for (const [res, client] of sseClients) {
+    if (client.clinicId === clinicId) res.write(msg);
+  }
+}
+
+function closeStreams(predicate: (token: string) => boolean) {
+  for (const [res, client] of sseClients) {
+    if (predicate(client.token)) {
+      sseClients.delete(res);
+      res.end();
+    }
   }
 }
 
 setInterval(() => {
+  // Drop streams whose session expired or was logged out elsewhere
+  closeStreams((token) => !getSession(token));
   for (const res of sseClients.keys()) res.write(': ping\n\n');
+  // Forget brute-force counters whose window has passed
+  const now = Date.now();
+  for (const [ip, a] of failedLogins) if (a.resetAt <= now) failedLogins.delete(ip);
 }, 25_000);
 
 // ==========================================
@@ -126,7 +146,7 @@ app.post('/api/login', (req, res) => {
   }
 
   const { username, password } = req.body ?? {};
-  const userId = authenticate(String(username ?? ''), String(password ?? '').trim());
+  const userId = authenticate(String(username ?? ''), String(password ?? ''));
   if (!userId) {
     const fresh = !attempts || attempts.resetAt <= now;
     failedLogins.set(ip, { count: fresh ? 1 : attempts.count + 1, resetAt: fresh ? now + LOGIN_WINDOW_MS : attempts.resetAt });
@@ -144,7 +164,10 @@ app.post('/api/login', (req, res) => {
 
 app.post('/api/logout', (req, res) => {
   const token = readCookie(req, SESSION_COOKIE);
-  if (token) deleteSession(token);
+  if (token) {
+    deleteSession(token);
+    closeStreams((t) => t === token);
+  }
   res.clearCookie(SESSION_COOKIE);
   res.json({ ok: true });
 });
@@ -192,8 +215,8 @@ app.get('/api/events', (req, res) => {
     Connection: 'keep-alive',
   });
   res.write(': connected\n\n');
-  sseClients.set(res, clinicOf(res));
-  req.on('close', () => sseClients.delete(res));
+  sseClients.set(res, { clinicId: clinicOf(res), token: readCookie(req, SESSION_COOKIE)! });
+  res.on('close', () => sseClients.delete(res));
 });
 
 app.get('/api/records', (_req, res) => {
@@ -232,11 +255,52 @@ app.delete('/api/records/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/records/import', (req, res) => {
+app.post('/api/records/import', async (req, res) => {
   if (!Array.isArray(req.body)) return res.status(400).json({ error: 'File backup phải là một mảng hồ sơ' });
-  const imported = importRecords(clinicOf(res), req.body);
-  broadcast(clinicOf(res), 'records');
-  res.json({ imported, total: countRecords(clinicOf(res)) });
+  try {
+    // Import overwrites matching records; keep a copy of the DB to roll back to
+    const snapshot = await snapshotDatabase('truoc-khi-nhap-file');
+    const imported = importRecords(clinicOf(res), req.body);
+    broadcast(clinicOf(res), 'records');
+    res.json({ imported, total: countRecords(clinicOf(res)), snapshot: path.basename(snapshot) });
+  } catch (err) {
+    sendSaveError(res, err);
+  }
+});
+
+// ---- Price list (Cài đặt > Bảng giá dịch vụ)
+app.get('/api/services', (_req, res) => {
+  res.json(listServices(clinicOf(res)));
+});
+
+app.post('/api/services', (req, res) => {
+  try {
+    const items = Array.isArray(req.body) ? req.body : [req.body];
+    if (items.length === 0 || items.length > 500) return res.status(400).json({ error: 'Danh sách dịch vụ không hợp lệ' });
+    createServices(clinicOf(res), items);
+    broadcast(clinicOf(res), 'services');
+    res.status(201).json(listServices(clinicOf(res)));
+  } catch (err) {
+    sendSaveError(res, err);
+  }
+});
+
+app.put('/api/services/:id', (req, res) => {
+  try {
+    const service = updateService(clinicOf(res), Number(req.params.id), req.body ?? {});
+    broadcast(clinicOf(res), 'services');
+    res.json(service);
+  } catch (err) {
+    sendSaveError(res, err);
+  }
+});
+
+app.delete('/api/services/:id', (req, res) => {
+  if (!deleteService(clinicOf(res), Number(req.params.id))) {
+    return res.status(404).json({ error: 'Không tìm thấy dịch vụ' });
+  }
+  broadcast(clinicOf(res), 'services');
+  res.json({ ok: true });
 });
 
 app.post('/api/payment-requests', (req, res) => {
@@ -250,6 +314,16 @@ app.post('/api/payment-requests', (req, res) => {
   const patientId = Number(req.body?.patientId) || null;
   const code = 'DH' + crypto.randomBytes(5).toString('hex').toUpperCase();
   res.status(201).json(createPaymentRequest(clinicOf(res), code, amount, patientId));
+});
+
+app.post('/api/payment-requests/:id/record', (req, res) => {
+  try {
+    const record = recordPaymentToLog(clinicOf(res), Number(req.params.id));
+    broadcast(clinicOf(res), 'records');
+    res.json(record);
+  } catch (err) {
+    sendSaveError(res, err);
+  }
 });
 
 app.get('/api/payment-requests/:id', (req, res) => {

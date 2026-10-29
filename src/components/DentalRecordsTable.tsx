@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { DentalRecord } from '../types';
+import { foldVietnamese, patientDebt } from '../utils/stats';
 import { 
   Search, 
   Calendar, 
@@ -15,18 +16,6 @@ import {
   CalendarPlus,
   Sparkles
 } from 'lucide-react';
-
-// "Nguyễn Văn Đức" -> "nguyen van duc", so searches work with or without diacritics
-function foldVietnamese(text: string): string {
-  return text
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/đ/g, 'd')
-    .replace(/Đ/g, 'D')
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-    .trim();
-}
 
 interface DentalRecordsTableProps {
   records: DentalRecord[];
@@ -70,14 +59,8 @@ export default function DentalRecordsTable({ records, onEdit }: DentalRecordsTab
       }
     }
 
-    // 4. Debt Only Filter
-    if (debtOnly) {
-      const hasDebt = (rec.plan || []).some((item) => {
-        const remainingVal = parseFloat(item.remaining as string) || 0;
-        return remainingVal > 0;
-      });
-      if (!hasDebt) return false;
-    }
+    // 4. Debt Only Filter (whole log: later payment rows cancel earlier debt)
+    if (debtOnly && patientDebt(rec) <= 0) return false;
 
     // 5. Porcelain Teeth ("răng sứ") Filter
     if (porcelainTeethOnly) {
@@ -285,7 +268,8 @@ export default function DentalRecordsTable({ records, onEdit }: DentalRecordsTab
               {paginatedRecords.length > 0 ? (
                 paginatedRecords.map((record, index) => {
                   const globalIndex = records.findIndex((r) => r.id === record.id);
-                  const isDebt = (record.plan || []).some((p) => (parseFloat(p.remaining as string) || 0) > 0);
+                  const debt = patientDebt(record);
+                  const isDebt = debt > 0;
                   
                   return (
                     <tr key={record.id} className={`hover:bg-slate-50/70 transition-colors ${isDebt ? 'bg-amber-50/15' : ''}`}>
@@ -297,7 +281,7 @@ export default function DentalRecordsTable({ records, onEdit }: DentalRecordsTab
                           <span className="text-sm font-bold text-slate-800">{record.name}</span>
                           {isDebt && (
                             <span className="inline-flex items-center text-[9px] bg-rose-50 text-rose-600 font-bold px-1.5 py-0.5 rounded border border-rose-100 mt-1 w-max">
-                              Hồ sơ có công nợ
+                              Còn nợ {(debt * 1000).toLocaleString('vi-VN')} đ
                             </span>
                           )}
                         </div>

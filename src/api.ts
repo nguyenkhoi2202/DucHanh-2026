@@ -1,4 +1,4 @@
-import type { BankConfig, DentalRecord, DentalRecordInput, PaymentRequest, SessionInfo } from './types';
+import type { BankConfig, DentalRecord, DentalRecordInput, PaymentRequest, ServiceItem, SessionInfo } from './types';
 
 export class UnauthorizedError extends Error {}
 
@@ -36,12 +36,21 @@ export const api = {
       body: JSON.stringify(records),
     }),
 
+  listServices: () => request<ServiceItem[]>('/api/services'),
+  createServices: (items: Omit<ServiceItem, 'id'>[]) =>
+    request<ServiceItem[]>('/api/services', { method: 'POST', body: JSON.stringify(items) }),
+  updateService: (id: number, data: Omit<ServiceItem, 'id'>) =>
+    request<ServiceItem>(`/api/services/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteService: (id: number) => request<{ ok: true }>(`/api/services/${id}`, { method: 'DELETE' }),
+
   createPaymentRequest: (amount: number, patientId: number | null) =>
     request<PaymentRequest>('/api/payment-requests', {
       method: 'POST',
       body: JSON.stringify({ amount, patientId }),
     }),
   getPaymentRequest: (id: number) => request<PaymentRequest>(`/api/payment-requests/${id}`),
+  recordPayment: (id: number) =>
+    request<DentalRecord>(`/api/payment-requests/${id}/record`, { method: 'POST' }),
 };
 
 /** Builds the SePay QR image URL (free, no API key needed). */

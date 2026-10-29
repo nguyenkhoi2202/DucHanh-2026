@@ -1,10 +1,12 @@
-import React, { useEffect } from 'react';
-import { CheckCircle2 } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { CheckCircle2, NotebookPen } from 'lucide-react';
 import type { PaymentRequest } from '../types';
 
 interface PaymentSuccessDialogProps {
   payment: PaymentRequest | null;
+  queued: number; // further confirmed payments waiting behind this one
   onClose: () => void;
+  onRecord: (payment: PaymentRequest) => Promise<boolean>; // adds the payment row to the treatment log
 }
 
 // Short two-note chime so the front desk hears the payment arrive
@@ -35,10 +37,21 @@ function formatTime(ms: number | null): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())} ${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}`;
 }
 
-export default function PaymentSuccessDialog({ payment, onClose }: PaymentSuccessDialogProps) {
+export default function PaymentSuccessDialog({ payment, queued, onClose, onRecord }: PaymentSuccessDialogProps) {
+  const [recording, setRecording] = useState(false);
+  const [recorded, setRecorded] = useState(false);
+
   useEffect(() => {
     if (payment) playChime();
+    setRecorded(!!payment?.recordedAt);
   }, [payment?.id]);
+
+  async function handleRecord() {
+    if (!payment) return;
+    setRecording(true);
+    if (await onRecord(payment)) setRecorded(true);
+    setRecording(false);
+  }
 
   if (!payment) return null;
 
@@ -75,18 +88,30 @@ export default function PaymentSuccessDialog({ payment, onClose }: PaymentSucces
               <span className="text-slate-700 font-mono">{payment.bankReference}</span>
             </div>
           )}
-          <p className="pt-2 text-[11px] text-slate-400">
-            Nhớ cập nhật cột "Đã trả" trong nhật ký điều trị của bệnh nhân.
-          </p>
         </div>
 
-        <div className="px-6 pb-6">
+        <div className="px-6 pb-6 space-y-2">
+          {payment.patientId ? (
+            <button
+              id="payment_record_btn"
+              onClick={handleRecord}
+              disabled={recording || recorded}
+              className="w-full py-2.5 flex items-center justify-center gap-1.5 border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 disabled:opacity-60 text-emerald-800 font-bold text-sm rounded-xl transition-colors cursor-pointer disabled:cursor-default"
+            >
+              <NotebookPen size={15} />
+              {recorded ? 'Đã ghi vào nhật ký điều trị' : recording ? 'Đang ghi...' : 'Ghi vào nhật ký điều trị'}
+            </button>
+          ) : (
+            <p className="text-[11px] text-slate-400 text-center">
+              Mã QR này không gắn với hồ sơ nào: nhớ ghi số tiền vào nhật ký điều trị của bệnh nhân.
+            </p>
+          )}
           <button
             id="payment_success_close_btn"
             onClick={onClose}
             className="w-full py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-sm rounded-xl transition-colors cursor-pointer"
           >
-            Hoàn tất
+            {queued > 0 ? `Tiếp (${queued} thanh toán nữa)` : 'Hoàn tất'}
           </button>
         </div>
       </div>

@@ -8,3 +8,7 @@ data/
 .DS_Store
 dist-server/
 deploy/
+
+# Patient data exports/backups dropped in the project root
+/DucHanh*.txt
+/DucHanh*.json

@@ -1,8 +1,8 @@
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, backup } from 'node:sqlite';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { ClinicInfo, DentalRecord, PlanItem, PaymentRequest } from '../src/types';
+import type { ClinicInfo, DentalRecord, PlanItem, PaymentRequest, ServiceItem } from '../src/types';
 
 const DB_PATH = process.env.DB_PATH || path.resolve(process.cwd(), 'data', 'duchanh.db');
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
@@ -139,6 +139,25 @@ for (const table of ['patients', 'payment_requests']) {
 }
 db.exec('CREATE INDEX IF NOT EXISTS idx_patients_clinic ON patients(clinic_id)');
 
+// Price list (per clinic). Treatment rows keep free text, so editing or deleting
+// a service never changes past records.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS services (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    clinic_id  INTEGER NOT NULL REFERENCES clinics(id),
+    name       TEXT NOT NULL COLLATE NOCASE,
+    price      INTEGER NOT NULL DEFAULT 0,  -- thousands of VND, like treatment rows
+    active     INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    UNIQUE (clinic_id, name)
+  );
+`);
+
+// When a confirmed QR payment was written into the patient's treatment log
+if (!hasColumn('payment_requests', 'recorded_at')) {
+  db.exec('ALTER TABLE payment_requests ADD COLUMN recorded_at INTEGER');
+}
+
 // Amounts are stored the way the clinic types them: in thousands of VND ("220" = 220.000đ).
 function toInt(v: unknown): number {
   const n = Math.round(parseFloat(String(v ?? '').replace(/[^\d.-]/g, '')));
@@ -231,7 +250,7 @@ const insertTreatment = db.prepare(`
 `);
 
 function writeRecord(clinicId: number, input: Partial<DentalRecord>, id: number) {
-  insertPatient.run({
+  const written = insertPatient.run({
     id,
     clinic_id: clinicId,
     name: str(input.name),
@@ -242,6 +261,8 @@ function writeRecord(clinicId: number, input: Partial<DentalRecord>, id: number)
     appointment: str(input.appointment),
     now: Date.now(),
   });
+  // The upsert skips rows owned by another clinic; never rewrite their treatments
+  if (Number(written.changes) === 0) throw new Error(`Mã hồ sơ ${id} đang thuộc nha khoa khác`);
   deleteTreatments.run(id);
   (input.plan ?? []).forEach((p, idx) => {
     const cost = toInt(p.cost);
@@ -289,7 +310,9 @@ export function importRecords(clinicId: number, records: Partial<DentalRecord>[]
     let count = 0;
     for (const rec of records) {
       if (!str(rec.name)) continue;
-      let id = Number(rec.id) > 0 ? Number(rec.id) : nextPatientId();
+      // Legacy ids are millisecond timestamps; anything else (huge, fractional, text) gets a new id
+      const legacyId = Number(rec.id);
+      let id = Number.isSafeInteger(legacyId) && legacyId > 0 && legacyId < MAX_PATIENT_ID ? legacyId : nextPatientId();
       const owner = patientClinic(id);
       if (owner !== undefined && owner !== clinicId) id = nextPatientId();
       writeRecord(clinicId, rec, id);
@@ -298,6 +321,8 @@ export function importRecords(clinicId: number, records: Partial<DentalRecord>[]
     return count;
   });
 }
+
+const MAX_PATIENT_ID = 1e14; // far beyond any timestamp id, well inside safe integers
 
 function nextPatientId(): number {
   // Keep the old millisecond-timestamp style ids so imported and new records never collide.
@@ -344,6 +369,8 @@ function verifyPassword(password: string, stored: string): boolean {
   return crypto.timingSafeEqual(actual, expected);
 }
 
+const DUMMY_HASH = hashPassword('not-a-real-password');
+
 export function countUsers(): number {
   return (db.prepare('SELECT COUNT(*) AS c FROM users').get() as { c: number }).c;
 }
@@ -355,7 +382,7 @@ export function setUser(username: string, password: string, clinicSlug: string) 
   db.prepare(`
     INSERT INTO users (username, password_hash, clinic_id) VALUES (?, ?, ?)
     ON CONFLICT(username) DO UPDATE SET password_hash = excluded.password_hash, clinic_id = excluded.clinic_id
-  `).run(username.trim(), hashPassword(password), clinic.id);
+  `).run(username.trim(), hashPassword(password), clinic.id);  // password kept exactly as typed
   // Changing a password logs that account out everywhere
   db.prepare('DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE username = ?)').run(username.trim());
 }
@@ -371,8 +398,8 @@ export function authenticate(username: string, password: string): number | undef
   const row = db.prepare('SELECT id, password_hash FROM users WHERE username = ?').get(username.trim()) as
     | { id: number; password_hash: string }
     | undefined;
-  // Hash anyway on unknown users so timing does not reveal which usernames exist
-  const ok = verifyPassword(password, row?.password_hash ?? hashPassword('dummy'));
+  // Verify against a dummy hash for unknown users so timing does not reveal which usernames exist
+  const ok = verifyPassword(password, row?.password_hash ?? DUMMY_HASH);
   return row && ok ? row.id : undefined;
 }
 
@@ -408,7 +435,7 @@ export function deleteSession(token: string) {
 // ==========================================
 type PaymentRequestRow = {
   id: number; code: string; clinic_id: number; patient_id: number | null; amount: number;
-  status: 'pending' | 'paid'; created_at: number; paid_at: number | null;
+  status: 'pending' | 'paid'; created_at: number; paid_at: number | null; recorded_at: number | null;
   patient_name?: string | null; paid_amount?: number | null; bank_reference?: string | null;
 };
 
@@ -423,6 +450,7 @@ function rowToRequest(r: PaymentRequestRow): PaymentRequest {
     status: r.status,
     createdAt: r.created_at,
     paidAt: r.paid_at,
+    recordedAt: r.recorded_at,
     paidAmount: r.paid_amount ?? null,
     bankReference: r.bank_reference ?? null,
   };
@@ -502,4 +530,119 @@ export function recordBankTransaction(body: SepayWebhookBody): PaymentRequest | 
     db.prepare("UPDATE payment_requests SET status = 'paid', paid_at = ? WHERE id = ?").run(Date.now(), match.id);
     return getPaymentRequest(match.id);
   });
+}
+
+// Today's date at the clinic, whatever timezone the server runs in
+function clinicToday(): string {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Ho_Chi_Minh' }).format(new Date());
+}
+
+/**
+ * Appends a confirmed QR payment to the linked patient's treatment log as a
+ * payment row (cost 0, paid X, remaining -X), which lowers the patient's debt.
+ * Each payment can be recorded once.
+ */
+export function recordPaymentToLog(clinicId: number, requestId: number): DentalRecord {
+  return transaction(() => {
+    const request = getPaymentRequest(requestId, clinicId);
+    if (!request) throw new NotFoundError('Không tìm thấy yêu cầu thanh toán');
+    if (request.status !== 'paid') throw new Error('Khoản thanh toán chưa được ngân hàng xác nhận');
+    if (request.recordedAt) throw new Error('Khoản thanh toán này đã được ghi vào nhật ký');
+    if (!request.patientId) throw new Error('Mã QR này không gắn với hồ sơ bệnh nhân nào');
+
+    const paidK = Math.round((request.paidAmount ?? request.amount) / 1000); // log is in thousands of VND
+    const { next } = db
+      .prepare('SELECT COALESCE(MAX(position), -1) + 1 AS next FROM treatments WHERE patient_id = ?')
+      .get(request.patientId) as { next: number };
+    insertTreatment.run(
+      request.patientId, next, clinicToday(), '', `Thanh toán chuyển khoản (${request.code})`,
+      0, paidK, -paidK, '',
+    );
+    db.prepare('UPDATE patients SET updated_at = ? WHERE id = ?').run(Date.now(), request.patientId);
+    db.prepare('UPDATE payment_requests SET recorded_at = ? WHERE id = ?').run(Date.now(), requestId);
+    return getRecord(clinicId, request.patientId)!;
+  });
+}
+
+// ==========================================
+// SERVICES (price list)
+// ==========================================
+type ServiceRow = { id: number; name: string; price: number; active: number };
+
+function rowToService(r: ServiceRow): ServiceItem {
+  return { id: r.id, name: r.name, price: r.price, active: !!r.active };
+}
+
+export function listServices(clinicId: number): ServiceItem[] {
+  return (db
+    .prepare('SELECT id, name, price, active FROM services WHERE clinic_id = ? ORDER BY active DESC, name')
+    .all(clinicId) as ServiceRow[]).map(rowToService);
+}
+
+function validateService(input: Partial<ServiceItem>): { name: string; price: number; active: number } {
+  const name = str(input.name).replace(/\s+/g, ' ');
+  if (!name) throw new Error('Tên dịch vụ không được để trống');
+  if (name.length > 120) throw new Error('Tên dịch vụ quá dài');
+  const price = toInt(input.price);
+  if (price < 0) throw new Error('Giá không được âm');
+  return { name, price, active: input.active === false ? 0 : 1 };
+}
+
+function duplicateNameError(err: unknown): never {
+  if (String((err as Error).message).includes('UNIQUE')) throw new Error('Đã có dịch vụ trùng tên');
+  throw err;
+}
+
+/** Adds one service, or several at once (used by "suggestions from history"). */
+export function createServices(clinicId: number, inputs: Partial<ServiceItem>[]): number {
+  return transaction(() => {
+    const insert = db.prepare('INSERT INTO services (clinic_id, name, price, active, created_at) VALUES (?, ?, ?, ?, ?)');
+    for (const input of inputs) {
+      const s = validateService(input);
+      try {
+        insert.run(clinicId, s.name, s.price, s.active, Date.now());
+      } catch (err) {
+        duplicateNameError(err);
+      }
+    }
+    return inputs.length;
+  });
+}
+
+export function updateService(clinicId: number, id: number, input: Partial<ServiceItem>): ServiceItem {
+  const s = validateService(input);
+  let changes = 0;
+  try {
+    changes = Number(db
+      .prepare('UPDATE services SET name = ?, price = ?, active = ? WHERE id = ? AND clinic_id = ?')
+      .run(s.name, s.price, s.active, id, clinicId).changes);
+  } catch (err) {
+    duplicateNameError(err);
+  }
+  if (!changes) throw new NotFoundError('Không tìm thấy dịch vụ');
+  return listServices(clinicId).find((x) => x.id === id)!;
+}
+
+export function deleteService(clinicId: number, id: number): boolean {
+  return db.prepare('DELETE FROM services WHERE id = ? AND clinic_id = ?').run(id, clinicId).changes > 0;
+}
+
+// ==========================================
+// SAFETY SNAPSHOTS
+// ==========================================
+const SNAPSHOT_KEEP = 10;
+
+/**
+ * Copies the whole database next to it before a risky bulk operation (file import),
+ * keeping the most recent SNAPSHOT_KEEP copies.
+ */
+export async function snapshotDatabase(reason: string): Promise<string> {
+  const dir = path.join(path.dirname(DB_PATH), 'snapshots');
+  fs.mkdirSync(dir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const file = path.join(dir, `${stamp}-${reason}.db`);
+  await backup(db, file);
+  const old = fs.readdirSync(dir).filter((f) => f.endsWith('.db')).sort().slice(0, -SNAPSHOT_KEEP);
+  for (const f of old) fs.rmSync(path.join(dir, f), { force: true });
+  return file;
 }

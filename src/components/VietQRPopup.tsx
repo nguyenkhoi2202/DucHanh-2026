@@ -13,6 +13,7 @@ interface VietQRPopupProps {
 
 export default function VietQRPopup({ request, config, patientName, onClose, onPaid }: VietQRPopupProps) {
   const [copied, setCopied] = React.useState(false);
+  const [received, setReceived] = React.useState(0); // partial transfers so far
 
   // SePay pushes payment events over the realtime channel; this poll is a
   // fallback in case that connection dropped while the QR was on screen.
@@ -22,6 +23,7 @@ export default function VietQRPopup({ request, config, patientName, onClose, onP
       try {
         const latest = await api.getPaymentRequest(request.id);
         if (latest.status === 'paid') onPaid(latest);
+        else if ((latest.paidAmount ?? 0) !== (request.paidAmount ?? 0)) setReceived(latest.paidAmount ?? 0);
       } catch (err) {
         console.error('Payment status poll failed', err);
       }
@@ -81,7 +83,14 @@ export default function VietQRPopup({ request, config, patientName, onClose, onP
               <Loader2 size={13} className="animate-spin text-teal-500" />
               Đang chờ ngân hàng xác nhận... Màn hình sẽ tự chuyển khi nhận được tiền.
             </p>
-          ) : (
+          ) : null}
+          {config.sepayEnabled && received > 0 && received < request.amount ? (
+            <p id="qr_partial_notice" className="text-xs font-semibold text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2 mb-4 text-center">
+              Đã nhận {received.toLocaleString('vi-VN')} đ, còn thiếu {(request.amount - received).toLocaleString('vi-VN')} đ.
+              Khách chuyển thêm với cùng nội dung là đủ.
+            </p>
+          ) : null}
+          {!config.sepayEnabled && (
             <p className="text-[11px] text-amber-600 mb-4 text-center">
               Chưa cấu hình SePay: hãy kiểm tra app ngân hàng để xác nhận đã nhận tiền.
             </p>

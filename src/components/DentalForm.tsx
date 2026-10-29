@@ -1,9 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { DentalRecord, PlanItem } from '../types';
-import { Plus, Trash2, Save, FilePlus, User, Phone, Calendar, MapPin, Hash, QrCode } from 'lucide-react';
+import { DentalRecord, DentalRecordInput, PlanItem, ServiceItem } from '../types';
+import { foldVietnamese } from '../utils/stats';
+import { Plus, Trash2, Save, FilePlus, User, Phone, Calendar, MapPin, Hash, QrCode, Printer } from 'lucide-react';
 
 interface DentalFormProps {
   activeRecord: DentalRecord | null;
+  services: ServiceItem[]; // price list, suggested in the treatment column
   onSubmit: (data: {
     name: string;
     phone: string;
@@ -16,14 +18,30 @@ interface DentalFormProps {
   onDelete: () => void;
   onCancel: () => void;
   onGenerateQR?: (amount: number, patientName: string) => void; // omitted when the clinic has no QR payments
+  onPrint: (data: DentalRecordInput) => void;
+  // A row the server just added to this patient (a recorded QR payment); merged into the
+  // form so unsaved edits survive and a later save keeps the new row
+  appendedRow?: { recordId: number; row: PlanItem; seq: number } | null;
+}
+
+// Comparable form contents; numbers and numeric strings ("400" vs 400) compare equal
+function snapshot(d: DentalRecordInput): string {
+  const s = (v: unknown) => String(v ?? '');
+  return JSON.stringify([
+    d.name, d.phone, d.address, d.dob, d.visitDate, d.appointment,
+    (d.plan || []).map((p) => [p.date, p.tooth, p.treatment, p.cost, p.paid, p.remaining, p.doctor].map(s)),
+  ].map((v) => (Array.isArray(v) ? v : s(v))));
 }
 
 export default function DentalForm({
   activeRecord,
+  services,
   onSubmit,
   onDelete,
   onCancel,
   onGenerateQR,
+  onPrint,
+  appendedRow,
 }: DentalFormProps) {
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
@@ -34,6 +52,8 @@ export default function DentalForm({
   const [plan, setPlan] = useState<PlanItem[]>([]);
   const [qrMode, setQrMode] = useState<'remaining' | 'custom'>('remaining');
   const [qrCustomAmount, setQrCustomAmount] = useState('');
+  // What the server has for this patient, to tell whether the form has unsaved changes
+  const [baseline, setBaseline] = useState<DentalRecordInput | null>(activeRecord);
 
   // Default values for today (local date; toISOString() would give the UTC date)
   const getTodayStr = () => {
@@ -51,6 +71,7 @@ export default function DentalForm({
       setVisitDate(activeRecord.visitDate);
       setAppointment(activeRecord.appointment);
       setPlan(activeRecord.plan || []);
+      setBaseline(activeRecord);
     } else {
       setName('');
       setPhone('');
@@ -72,6 +93,13 @@ export default function DentalForm({
     }
   }, [activeRecord]);
 
+  useEffect(() => {
+    if (!appendedRow || appendedRow.recordId !== activeRecord?.id) return;
+    setPlan((prev) => [...prev, appendedRow.row]);
+    setBaseline((prev) => prev && { ...prev, plan: [...(prev.plan || []), appendedRow.row] });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appendedRow?.seq]);
+
   // Handler to add a treatment plan row
   function addRow() {
     const today = getTodayStr();
@@ -89,6 +117,8 @@ export default function DentalForm({
     ]);
   }
 
+  const activeServices = services.filter((s) => s.active);
+
   // Update a specific field in a treatment plan row
   function handlePlanChange(index: number, field: keyof PlanItem, value: string) {
     setPlan((prevPlan) => {
@@ -97,10 +127,20 @@ export default function DentalForm({
 
         const updatedItem = { ...item, [field]: value };
 
+        // Picking a price-list service fills in its price, unless a cost was already typed
+        let costChanged = field === 'cost';
+        if (field === 'treatment' && !(parseFloat(item.cost as string) > 0)) {
+          const service = activeServices.find((s) => foldVietnamese(s.name) === foldVietnamese(value));
+          if (service && service.price > 0) {
+            updatedItem.cost = String(service.price);
+            costChanged = true;
+          }
+        }
+
         // Auto calculate remaining when cost or paid changes
-        if (field === 'cost' || field === 'paid') {
-          const cost = parseFloat((field === 'cost' ? value : item.cost) as string) || 0;
-          const paid = parseFloat((field === 'paid' ? value : item.paid) as string) || 0;
+        if (costChanged || field === 'paid') {
+          const cost = parseFloat(updatedItem.cost as string) || 0;
+          const paid = parseFloat(updatedItem.paid as string) || 0;
           updatedItem.remaining = (cost - paid).toString();
         }
 
@@ -119,7 +159,15 @@ export default function DentalForm({
   // Calculate overall totals inside the form
   const totalCost = plan.reduce((sum, item) => sum + (parseFloat(item.cost as string) || 0), 0);
   const totalPaid = plan.reduce((sum, item) => sum + (parseFloat(item.paid as string) || 0), 0);
-  const totalRemaining = totalCost - totalPaid;
+  // Sum of the "remaining" column, same as the patient list, dashboard and receipt
+  // (old data has a few hand-adjusted rows where remaining != cost - paid)
+  const totalRemaining = plan.reduce((sum, item) => sum + (parseFloat(item.remaining as string) || 0), 0);
+
+  // A QR for a saved patient must match what is saved, or recording the payment
+  // later would be based on rows that never reached the server
+  const hasUnsavedChanges =
+    !!activeRecord && !!baseline &&
+    snapshot({ name, phone, address, dob, visitDate, appointment, plan }) !== snapshot(baseline);
 
   // Amounts in the form are in thousands of VND; the QR needs the full amount
   const qrAmountK = qrMode === 'remaining' ? totalRemaining : parseInt(qrCustomAmount, 10) || 0;
@@ -161,6 +209,13 @@ export default function DentalForm({
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-6">
+        <datalist id="service_options">
+          {activeServices.map((s) => (
+            <option key={s.id} value={s.name}>
+              {s.price ? `${(s.price * 1000).toLocaleString('vi-VN')} đ` : ''}
+            </option>
+          ))}
+        </datalist>
         {/* Core Info Input Grid */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-6 gap-4 bg-slate-50 p-4 rounded-xl border border-slate-100/80">
           <div className="col-span-1 lg:col-span-2">
@@ -299,7 +354,8 @@ export default function DentalForm({
                         type="text"
                         value={item.treatment}
                         onChange={(e) => handlePlanChange(index, 'treatment', e.target.value)}
-                        placeholder="Nhổ răng, hàn răng, trám răng..."
+                        list={activeServices.length ? 'service_options' : undefined}
+                        placeholder={activeServices.length ? 'Gõ để chọn dịch vụ trong bảng giá...' : 'Nhổ răng, hàn răng, trám răng...'}
                         className="w-full bg-slate-50 focus:bg-white border border-slate-200 focus:ring-1 focus:ring-teal-500 focus:outline-none rounded-md px-2.5 py-1 text-xs text-slate-700"
                         required
                       />
@@ -431,14 +487,33 @@ export default function DentalForm({
                 id="form_qr_generation_btn"
                 type="button"
                 onClick={() => onGenerateQR(qrAmount, name.trim())}
-                disabled={qrAmount < 1000}
+                disabled={qrAmount < 1000 || hasUnsavedChanges}
                 className="p-1.5 bg-teal-600 hover:bg-teal-700 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-md transition-colors cursor-pointer"
                 title="Tạo mã QR thanh toán"
               >
                 <QrCode size={14} />
               </button>
+              {hasUnsavedChanges && (
+                <span id="qr_unsaved_hint" className="basis-full text-[10px] text-amber-700">
+                  Bấm "Lưu hồ sơ" trước khi tạo mã QR.
+                </span>
+              )}
             </div>
             )}
+
+            <button
+              id="print_record_btn"
+              type="button"
+              onClick={() =>
+                onPrint({ name: name.trim(), phone: phone.trim(), address: address.trim(), dob: dob.trim(), visitDate, appointment, plan })
+              }
+              disabled={!name.trim()}
+              className="px-4 py-2.5 bg-white hover:bg-slate-50 disabled:opacity-40 text-slate-700 font-bold text-sm rounded-lg border border-slate-200 flex items-center gap-1.5 transition-all cursor-pointer disabled:cursor-not-allowed"
+              title="In phiếu điều trị & thanh toán"
+            >
+              <Printer size={16} />
+              <span>In phiếu</span>
+            </button>
 
             {activeRecord && (
               <button

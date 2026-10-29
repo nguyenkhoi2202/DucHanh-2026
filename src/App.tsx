@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { api, UnauthorizedError } from './api';
-import { DentalRecord, DentalRecordInput, PaymentRequest, PlanItem, SessionInfo } from './types';
+import { DentalRecord, DentalRecordInput, PaymentRequest, PlanItem, ServiceItem, SessionInfo } from './types';
 
 // Subcomponents
 import Login from './components/Login';
@@ -9,6 +9,11 @@ import DentalRecordsTable from './components/DentalRecordsTable';
 import VietQRPopup from './components/VietQRPopup';
 import TotalsDialog from './components/TotalsDialog';
 import PaymentSuccessDialog from './components/PaymentSuccessDialog';
+import Dashboard from './components/Dashboard';
+import AppointmentsPanel from './components/AppointmentsPanel';
+import SettingsPanel from './components/SettingsPanel';
+import { printReceipt } from './utils/printReceipt';
+import { computeAppointments, todayStr } from './utils/stats';
 
 // Icons
 import {
@@ -22,15 +27,26 @@ import {
   TrendingUp,
   Wifi,
   WifiOff,
+  LayoutDashboard,
+  Users,
+  CalendarDays,
+  Settings,
 } from 'lucide-react';
 
 // Records saved by the old version of the app, before the SQLite server existed
 const LEGACY_STORAGE_KEY = 'dentalRecords';
 
-function todayStr(date = new Date()): string {
-  const dd = String(date.getDate()).padStart(2, '0');
-  const mm = String(date.getMonth() + 1).padStart(2, '0');
-  return `${date.getFullYear()}-${mm}-${dd}`;
+type Tab = 'dashboard' | 'patients' | 'appointments' | 'settings';
+const TAB_STORAGE_KEY = 'activeTab';
+
+function readSavedTab(): Tab {
+  try {
+    const saved = localStorage.getItem(TAB_STORAGE_KEY);
+    if (saved === 'dashboard' || saved === 'patients' || saved === 'appointments' || saved === 'settings') return saved;
+  } catch {
+    // storage unavailable (private mode): fall back to the default tab
+  }
+  return 'dashboard';
 }
 
 function sumPlans(plans: PlanItem[]) {
@@ -64,10 +80,21 @@ export default function App() {
 
   // 2. Core dental record states
   const [records, setRecords] = useState<DentalRecord[]>([]);
+  const [services, setServices] = useState<ServiceItem[]>([]);
   const [activeRecord, setActiveRecord] = useState<DentalRecord | null>(null);
   // Bumped after each save so the form remounts empty (prevents duplicate saves)
   const [formKey, setFormKey] = useState(0);
   const [isLive, setIsLive] = useState(false);
+  const [tab, setTabState] = useState<Tab>(readSavedTab);
+
+  function setTab(next: Tab) {
+    setTabState(next);
+    try {
+      localStorage.setItem(TAB_STORAGE_KEY, next);
+    } catch {
+      // ignore: remembering the tab is only a convenience
+    }
+  }
 
   // 3. Real-time dynamic clock tracking State
   const [clockStr, setClockStr] = useState('');
@@ -79,7 +106,11 @@ export default function App() {
   // 5. QR payment popup state
   const [paymentRequest, setPaymentRequest] = useState<PaymentRequest | null>(null);
   const [qrPatientName, setQrPatientName] = useState('');
-  const [paidPayment, setPaidPayment] = useState<PaymentRequest | null>(null);
+  // Confirmed payments waiting to be acknowledged, oldest first (shown one at a time)
+  const [paidQueue, setPaidQueue] = useState<PaymentRequest[]>([]);
+  const [appendedRow, setAppendedRow] = useState<{ recordId: number; row: PlanItem; seq: number } | null>(null);
+  // Local date; ticks over at midnight so long-open tabs don't show yesterday's numbers
+  const [today, setToday] = useState(todayStr());
 
   // 6. Totals analytical dialog state
   const [isTotalsOpen, setIsTotalsOpen] = useState(false);
@@ -108,6 +139,14 @@ export default function App() {
     }
   }, [handleApiError]);
 
+  const loadServices = useCallback(async () => {
+    try {
+      setServices(await api.listServices());
+    } catch (err) {
+      handleApiError(err, 'Không tải được bảng giá');
+    }
+  }, [handleApiError]);
+
   // ==========================================
   // EFFECT 1: Check whether the server session is still valid
   // ==========================================
@@ -128,6 +167,7 @@ export default function App() {
     if (authState !== 'in') return;
 
     loadRecords().then(() => offerLegacyMigration());
+    loadServices();
 
     const events = new EventSource('/api/events');
     events.onopen = () => {
@@ -136,11 +176,12 @@ export default function App() {
     };
     events.onerror = () => setIsLive(false);
     events.addEventListener('records', () => loadRecords());
+    events.addEventListener('services', () => loadServices());
     // Shown on every open device, even if the QR popup was already closed
     events.addEventListener('payment', (e) => handlePaid(JSON.parse((e as MessageEvent).data)));
     return () => events.close();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authState, loadRecords]);
+  }, [authState, loadRecords, loadServices]);
 
   // ==========================================
   // EFFECT 3: Live Clock Update (Runs every second)
@@ -153,6 +194,7 @@ export default function App() {
       const minutes = String(now.getMinutes()).padStart(2, '0');
       const seconds = String(now.getSeconds()).padStart(2, '0');
       setClockStr(`${dd}-${mm}-${yyyy} ${hours}:${minutes}:${seconds}`);
+      setToday(todayStr(now)); // same string most seconds, so React skips the re-render
     }
 
     updateClock();
@@ -203,6 +245,7 @@ export default function App() {
   async function handleLogout() {
     await api.logout().catch(() => {});
     setRecords([]);
+    setServices([]);
     setActiveRecord(null);
     setSession(null);
     setAuthState('out');
@@ -229,8 +272,9 @@ export default function App() {
 
   function handleEditRecord(record: DentalRecord) {
     setActiveRecord(record);
-    // Smooth scroll to form element
-    document.getElementById('dentalForm')?.scrollIntoView({ behavior: 'smooth' });
+    setTab('patients');
+    // Smooth scroll to the form once the patients tab has rendered
+    setTimeout(() => document.getElementById('dentalForm')?.scrollIntoView({ behavior: 'smooth' }), 0);
   }
 
   async function handleDeleteActiveRecord() {
@@ -376,13 +420,35 @@ export default function App() {
     }
   }
 
+  // Writes a confirmed QR payment into the patient's treatment log
+  async function handleRecordPayment(payment: PaymentRequest): Promise<boolean> {
+    try {
+      const updated = await api.recordPayment(payment.id);
+      // If that patient is open in the form, add the new row there too (keeping any
+      // unsaved edits) so a later save doesn't drop the payment row
+      const row = updated.plan[updated.plan.length - 1];
+      if (activeRecord?.id === updated.id && row) {
+        setAppendedRow((prev) => ({ recordId: updated.id, row, seq: (prev?.seq ?? 0) + 1 }));
+      }
+      loadRecords();
+      return true;
+    } catch (err) {
+      handleApiError(err, 'Không ghi được vào nhật ký');
+      return false;
+    }
+  }
+
   // The QR popup gives way to the success screen once the bank confirms
   const handlePaid = useCallback((paid: PaymentRequest) => {
     setPaymentRequest((current) => (current && current.id === paid.id ? null : current));
-    setPaidPayment((current) => (current && current.id === paid.id ? current : paid));
+    setPaidQueue((queue) => (queue.some((p) => p.id === paid.id) ? queue : [...queue, paid]));
   }, []);
 
   const clinic = session?.clinic;
+  const appointmentsDueToday = useMemo(
+    () => computeAppointments(records, today).today.filter((a) => !a.arrived).length,
+    [records, today]
+  );
 
   useEffect(() => {
     document.title = clinic ? `${clinic.name} | Quản Lý Hồ Sơ Bệnh Nhân` : 'Quản Lý Hồ Sơ Nha Khoa';
@@ -474,13 +540,44 @@ export default function App() {
       {/* Main Scaffold Operations Body */}
       <main className="max-w-7xl mx-auto w-full px-4 py-6 space-y-6 flex-1">
 
-        {/* Quick Operations toolbar */}
-        <div className="bg-white rounded-2xl shadow-xs border border-slate-100 p-4 flex flex-wrap items-center gap-2">
+        {/* Navigation tabs + quick actions */}
+        <div className="bg-white rounded-2xl shadow-xs border border-slate-100 p-2 flex flex-wrap items-center justify-between gap-2">
+          <nav className="flex flex-wrap gap-1" aria-label="Chức năng">
+            {(
+              [
+                { id: 'dashboard', label: 'Tổng quan', icon: <LayoutDashboard size={15} /> },
+                { id: 'patients', label: 'Bệnh nhân', icon: <Users size={15} /> },
+                { id: 'appointments', label: 'Lịch hẹn', icon: <CalendarDays size={15} /> },
+                { id: 'settings', label: 'Cài đặt', icon: <Settings size={15} /> },
+              ] as const
+            ).map((t) => (
+              <button
+                key={t.id}
+                id={`tab_${t.id}`}
+                onClick={() => setTab(t.id)}
+                aria-current={tab === t.id ? 'page' : undefined}
+                className={`px-4 py-2 rounded-xl text-sm font-bold flex items-center gap-1.5 transition-colors cursor-pointer ${
+                  tab === t.id ? 'bg-teal-600 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
+                }`}
+              >
+                {t.icon}
+                {t.label}
+                {t.id === 'appointments' && appointmentsDueToday > 0 && (
+                  <span className={`ml-0.5 text-[10px] font-black rounded-full px-1.5 ${tab === t.id ? 'bg-white text-teal-700' : 'bg-rose-500 text-white'}`}>
+                    {appointmentsDueToday}
+                  </span>
+                )}
+              </button>
+            ))}
+          </nav>
+
+          <div className="flex flex-wrap items-center gap-2">
           <button
             id="add_new_patient_direct_btn"
             onClick={() => {
               handleCancelEdit();
-              document.getElementById('dentalForm')?.scrollIntoView({ behavior: 'smooth' });
+              setTab('patients');
+              setTimeout(() => document.getElementById('dentalForm')?.scrollIntoView({ behavior: 'smooth' }), 0);
             }}
             className="px-4.5 py-2.5 bg-teal-600 hover:bg-teal-700 text-white font-bold text-xs rounded-xl shadow-xs hover:shadow-md transition-all cursor-pointer flex items-center gap-1.5"
           >
@@ -494,7 +591,7 @@ export default function App() {
             className="px-4 py-2.5 bg-teal-50 hover:bg-teal-100 border border-teal-200/50 text-teal-700 font-semibold text-xs rounded-xl transition-all cursor-pointer flex items-center gap-1.5"
           >
             <TrendingUp size={14} />
-            <span>Thống kê doanh thu tháng này</span>
+            <span>Báo cáo tháng này</span>
           </button>
 
           <button
@@ -503,19 +600,33 @@ export default function App() {
             className="px-4 py-2.5 bg-teal-50 hover:bg-teal-100 border border-teal-200/50 text-teal-700 font-semibold text-xs rounded-xl transition-all cursor-pointer flex items-center gap-1.5"
           >
             <DollarSign size={14} />
-            <span>Thống kê doanh thu theo file</span>
+            <span>Thống kê theo file</span>
           </button>
+          </div>
         </div>
 
+        {tab === 'dashboard' && <Dashboard records={records} services={services} today={today} onOpenRecord={handleEditRecord} />}
+
+        {tab === 'settings' && (
+          <SettingsPanel services={services} records={records} onChanged={loadServices} onError={handleApiError} />
+        )}
+
+        {tab === 'appointments' && <AppointmentsPanel records={records} today={today} onOpenRecord={handleEditRecord} />}
+
+        {tab === 'patients' && (
+        <>
         {/* Dynamic Patient Info Details / Add Form */}
         <section id="dentalForm">
           <DentalForm
-            key={activeRecord ? `edit-${activeRecord.id}` : `new-${formKey}`}
+            key={activeRecord ? `edit-${activeRecord.id}-${formKey}` : `new-${formKey}`}
             activeRecord={activeRecord}
+            services={services}
             onSubmit={handleSaveRecord}
             onDelete={handleDeleteActiveRecord}
             onCancel={handleCancelEdit}
             onGenerateQR={session?.bank ? handleGenerateQR : undefined}
+            onPrint={(data) => clinic && printReceipt(clinic, data)}
+            appendedRow={appendedRow}
           />
         </section>
 
@@ -558,6 +669,8 @@ export default function App() {
             </button>
           </div>
         </section>
+        </>
+        )}
 
       </main>
 
@@ -614,7 +727,12 @@ export default function App() {
       {/* ==========================================
           MODAL 4: Payment received (SePay webhook)
           ========================================== */}
-      <PaymentSuccessDialog payment={paidPayment} onClose={() => setPaidPayment(null)} />
+      <PaymentSuccessDialog
+        payment={paidQueue[0] ?? null}
+        queued={paidQueue.length - 1}
+        onClose={() => setPaidQueue((queue) => queue.slice(1))}
+        onRecord={handleRecordPayment}
+      />
 
     </div>
   );
