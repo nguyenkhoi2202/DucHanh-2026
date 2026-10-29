@@ -35,6 +35,19 @@ scripts/deploy.sh user@server             # các lần sau: chỉ cập nhật c
 `deploy/cloudflared/` (thông tin đăng nhập tunnel) và `.env` không nằm trong git; giữ bí mật.
 Dữ liệu trên server nằm ở `~/duchanh/data/duchanh.db`.
 
+### Sao lưu tự động
+
+Cron trên server chạy `scripts/backup-db.sh` lúc 02:00 giờ VN mỗi ngày: chụp DB khi đang chạy, kiểm tra
+toàn vẹn, nén vào `~/duchanh-backups/duchanh-YYYYMMDD-HHMMSS.db.gz`, giữ 30 ngày. Nhật ký: `~/duchanh-backups/backup.log`.
+
+Khôi phục một bản sao lưu:
+
+```bash
+cd ~/duchanh && docker compose stop app
+gunzip -c ~/duchanh-backups/duchanh-<ngày-giờ>.db.gz > data/duchanh.db && rm -f data/duchanh.db-wal data/duchanh.db-shm
+docker compose start app
+```
+
 ## Dữ liệu
 
 - Toàn bộ dữ liệu nằm trong file `data/duchanh.db`. **Sao lưu file này định kỳ** (copy khi đang chạy vẫn được,
