@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Plus, Trash2, Save, Search, Sparkles, Eye, EyeOff, Tags } from 'lucide-react';
 import { api } from '../api';
 import type { DentalRecord, ServiceItem } from '../types';
@@ -19,6 +19,19 @@ function ServiceRow({ service, onChanged, onError }: { service: ServiceItem } & 
   const [price, setPrice] = useState(String(service.price));
   const [busy, setBusy] = useState(false);
   const dirty = name.trim() !== service.name || Number(price || 0) !== service.price;
+
+  // Another device changed this service: take the new values unless the user is mid-edit here
+  const lastServer = useRef({ name: service.name, price: service.price });
+  useEffect(() => {
+    const prev = lastServer.current;
+    const untouched = name.trim() === prev.name && Number(price || 0) === prev.price;
+    if (untouched) {
+      setName(service.name);
+      setPrice(String(service.price));
+    }
+    lastServer.current = { name: service.name, price: service.price };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [service.name, service.price]);
 
   async function save(patch: Partial<ServiceItem> = {}) {
     setBusy(true);
@@ -182,8 +195,7 @@ export default function SettingsPanel({ services, records, onChanged, onError }:
               </thead>
               <tbody className="divide-y divide-slate-50">
                 {visible.map((s) => (
-                  // Remount when the server copy changes so the inputs show fresh values
-                  <ServiceRow key={`${s.id}-${s.name}-${s.price}-${s.active}`} service={s} onChanged={onChanged} onError={onError} />
+                  <ServiceRow key={s.id} service={s} onChanged={onChanged} onError={onError} />
                 ))}
               </tbody>
             </table>

@@ -50,7 +50,9 @@ docker compose start app
 
 ## Nhiều nha khoa & tài khoản
 
-Một hệ thống phục vụ 2 nha khoa; mỗi tài khoản thuộc một nha khoa và chỉ thấy bệnh nhân của nha khoa đó.
+Một hệ thống phục vụ 2 nha khoa **hoàn toàn độc lập**: mỗi tài khoản thuộc một nha khoa và chỉ thấy, sửa,
+nhập, thống kê bệnh nhân / thanh toán / bảng giá của nha khoa đó. File backup có hồ sơ của nha khoa kia sẽ bị
+bỏ qua khi nhập. Tuỳ chọn giao diện lưu trong trình duyệt cũng tách riêng theo từng tài khoản.
 
 | Nha khoa | Mã (slug) | Thanh toán QR |
 |---|---|---|
@@ -68,11 +70,16 @@ docker exec duchanh-app node dist-server/user.js set <tên-đăng-nhập> <mật
 npm run user -- list
 ```
 
+## Kiểm thử
+
+```bash
+npm test     # chạy server thật trên DB tạm: tách biệt 2 nha khoa, SePay, xung đột khi sửa, đăng nhập
+```
+
 ## Dữ liệu
 
 - Toàn bộ dữ liệu nằm trong file `data/duchanh.db`. **Sao lưu file này định kỳ** (copy khi đang chạy vẫn được,
   nhưng an toàn nhất là dùng nút "Tải backup toàn bộ" trên web).
-- Lần đầu đăng nhập, nếu trình duyệt còn dữ liệu của phiên bản cũ (localStorage), web sẽ hỏi để chuyển sang.
 - Dữ liệu từ file backup JSON cũ (hoặc file tải từ Google Script cũ) nhập bằng nút "Nhập dữ liệu từ file backup".
 
 ## Thanh toán QR + SePay

@@ -1,6 +1,7 @@
 import type { BankConfig, DentalRecord, DentalRecordInput, PaymentRequest, ServiceItem, SessionInfo } from './types';
 
 export class UnauthorizedError extends Error {}
+export class ConflictError extends Error {} // the record was saved elsewhere in the meantime
 
 async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   const res = await fetch(url, {
@@ -10,6 +11,7 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   });
   const data = await res.json().catch(() => ({}));
   if (res.status === 401) throw new UnauthorizedError(data.error || 'Chưa đăng nhập');
+  if (res.status === 409) throw new ConflictError(data.error || 'Dữ liệu đã thay đổi');
   if (!res.ok) throw new Error(data.error || `Lỗi máy chủ (${res.status})`);
   return data as T;
 }
@@ -31,7 +33,7 @@ export const api = {
     request<DentalRecord>(`/api/records/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteRecord: (id: number) => request<{ ok: true }>(`/api/records/${id}`, { method: 'DELETE' }),
   importRecords: (records: unknown[]) =>
-    request<{ imported: number; total: number }>('/api/records/import', {
+    request<{ imported: number; skippedOtherClinic: number; total: number }>('/api/records/import', {
       method: 'POST',
       body: JSON.stringify(records),
     }),

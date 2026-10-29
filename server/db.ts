@@ -159,9 +159,18 @@ if (!hasColumn('payment_requests', 'recorded_at')) {
 }
 
 // Amounts are stored the way the clinic types them: in thousands of VND ("220" = 220.000đ).
+// "1.200" / "1,200" are read as thousands separators (1200), the Vietnamese way of writing numbers.
 function toInt(v: unknown): number {
-  const n = Math.round(parseFloat(String(v ?? '').replace(/[^\d.-]/g, '')));
+  let s = String(v ?? '').trim().replace(/\s/g, '');
+  if (/^-?\d{1,3}([.,]\d{3})+$/.test(s)) s = s.replace(/[.,]/g, '');
+  const n = Math.round(parseFloat(s.replace(/[^\d.-]/g, '')));
   return Number.isFinite(n) ? n : 0;
+}
+
+// "Bọc Sứ  Zico" -> "boc su zico": compare names ignoring case, accents and spacing
+function foldName(text: string): string {
+  return text.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g, 'd').replace(/Đ/g, 'D')
+    .toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
 function str(v: unknown): string {
@@ -173,7 +182,7 @@ function str(v: unknown): string {
 // ==========================================
 type PatientRow = {
   id: number; name: string; phone: string; address: string; age: string;
-  visit_date: string; appointment: string;
+  visit_date: string; appointment: string; updated_at: number;
 };
 type TreatmentRow = {
   patient_id: number; date: string; tooth: string; treatment: string;
@@ -217,6 +226,7 @@ function loadRecords(where: string, ...params: number[]): DentalRecord[] {
     dob: p.age,
     visitDate: p.visit_date,
     appointment: p.appointment,
+    updatedAt: p.updated_at,
     plan: plansByPatient.get(p.id) ?? [],
   }));
 }
@@ -289,10 +299,18 @@ function transaction<T>(fn: () => T): T {
 }
 
 export class NotFoundError extends Error {}
+export class ConflictError extends Error {}
 
 export function saveRecord(clinicId: number, input: Partial<DentalRecord>, id?: number): DentalRecord {
   if (!str(input.name)) throw new Error('Thiếu họ tên bệnh nhân');
   if (id !== undefined && patientClinic(id) !== clinicId) throw new NotFoundError('Không tìm thấy hồ sơ');
+  // Optimistic locking: refuse to overwrite a record someone else saved after this client loaded it
+  if (id !== undefined && input.updatedAt !== undefined) {
+    const current = db.prepare('SELECT updated_at FROM patients WHERE id = ?').get(id) as { updated_at: number };
+    if (current.updated_at !== Number(input.updatedAt)) {
+      throw new ConflictError('Hồ sơ này vừa được cập nhật trên máy khác');
+    }
+  }
   const recordId = id ?? nextPatientId();
   transaction(() => writeRecord(clinicId, input, recordId));
   return getRecord(clinicId, recordId)!;
@@ -304,21 +322,28 @@ export function deleteRecord(clinicId: number, id: number): boolean {
 
 // Imports legacy JSON backups (same shape as the old localStorage data).
 // Records are upserted by id, so importing the same file twice is harmless.
-// An id already used by the other clinic gets a fresh id instead of overwriting it.
-export function importRecords(clinicId: number, records: Partial<DentalRecord>[]): number {
+// A record whose id belongs to the OTHER clinic means the file is that clinic's data:
+// it is skipped, so the clinics' patient lists never mix.
+export function importRecords(
+  clinicId: number, records: Partial<DentalRecord>[],
+): { imported: number; skippedOtherClinic: number } {
   return transaction(() => {
-    let count = 0;
+    let imported = 0;
+    let skippedOtherClinic = 0;
     for (const rec of records) {
       if (!str(rec.name)) continue;
       // Legacy ids are millisecond timestamps; anything else (huge, fractional, text) gets a new id
       const legacyId = Number(rec.id);
-      let id = Number.isSafeInteger(legacyId) && legacyId > 0 && legacyId < MAX_PATIENT_ID ? legacyId : nextPatientId();
+      const id = Number.isSafeInteger(legacyId) && legacyId > 0 && legacyId < MAX_PATIENT_ID ? legacyId : nextPatientId();
       const owner = patientClinic(id);
-      if (owner !== undefined && owner !== clinicId) id = nextPatientId();
+      if (owner !== undefined && owner !== clinicId) {
+        skippedOtherClinic++;
+        continue;
+      }
       writeRecord(clinicId, rec, id);
-      count++;
+      imported++;
     }
-    return count;
+    return { imported, skippedOtherClinic };
   });
 }
 
@@ -361,11 +386,14 @@ function hashPassword(password: string): string {
   return `scrypt$${salt.toString('hex')}$${hash.toString('hex')}`;
 }
 
-function verifyPassword(password: string, stored: string): boolean {
+// Async so that a burst of login attempts does not block every other request
+async function verifyPassword(password: string, stored: string): Promise<boolean> {
   const [scheme, saltHex, hashHex] = stored.split('$');
   if (scheme !== 'scrypt') return false;
   const expected = Buffer.from(hashHex, 'hex');
-  const actual = crypto.scryptSync(password, Buffer.from(saltHex, 'hex'), expected.length);
+  const actual = await new Promise<Buffer>((resolve, reject) =>
+    crypto.scrypt(password, Buffer.from(saltHex, 'hex'), expected.length, (err, key) => (err ? reject(err) : resolve(key))),
+  );
   return crypto.timingSafeEqual(actual, expected);
 }
 
@@ -394,12 +422,12 @@ export function listUsers(): { username: string; clinic: string }[] {
 }
 
 /** Returns the user id when the credentials are right. */
-export function authenticate(username: string, password: string): number | undefined {
+export async function authenticate(username: string, password: string): Promise<number | undefined> {
   const row = db.prepare('SELECT id, password_hash FROM users WHERE username = ?').get(username.trim()) as
     | { id: number; password_hash: string }
     | undefined;
   // Verify against a dummy hash for unknown users so timing does not reveal which usernames exist
-  const ok = verifyPassword(password, row?.password_hash ?? DUMMY_HASH);
+  const ok = await verifyPassword(password, row?.password_hash ?? DUMMY_HASH);
   return row && ok ? row.id : undefined;
 }
 
@@ -593,12 +621,19 @@ function duplicateNameError(err: unknown): never {
   throw err;
 }
 
+function assertNameFree(clinicId: number, name: string, exceptId?: number) {
+  const taken = (db.prepare('SELECT id, name FROM services WHERE clinic_id = ?').all(clinicId) as { id: number; name: string }[])
+    .some((s) => s.id !== exceptId && foldName(s.name) === foldName(name));
+  if (taken) throw new Error(`Đã có dịch vụ trùng tên "${name}"`);
+}
+
 /** Adds one service, or several at once (used by "suggestions from history"). */
 export function createServices(clinicId: number, inputs: Partial<ServiceItem>[]): number {
   return transaction(() => {
     const insert = db.prepare('INSERT INTO services (clinic_id, name, price, active, created_at) VALUES (?, ?, ?, ?, ?)');
     for (const input of inputs) {
       const s = validateService(input);
+      assertNameFree(clinicId, s.name);
       try {
         insert.run(clinicId, s.name, s.price, s.active, Date.now());
       } catch (err) {
@@ -611,6 +646,7 @@ export function createServices(clinicId: number, inputs: Partial<ServiceItem>[])
 
 export function updateService(clinicId: number, id: number, input: Partial<ServiceItem>): ServiceItem {
   const s = validateService(input);
+  assertNameFree(clinicId, s.name, id);
   let changes = 0;
   try {
     changes = Number(db

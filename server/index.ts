@@ -6,6 +6,7 @@ import path from 'node:path';
 if (fs.existsSync('.env')) process.loadEnvFile('.env');
 
 const {
+  ConflictError,
   NotFoundError,
   authenticate,
   countRecords,
@@ -137,22 +138,35 @@ function clinicOf(res: Response): number {
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const failedLogins = new Map<string, { count: number; resetAt: number }>();
 
-app.post('/api/login', (req, res) => {
-  const ip = req.ip ?? 'unknown';
+// Counted both per IP and per username, so rotating IP addresses doesn't help an attacker
+function isLocked(key: string, now: number): boolean {
+  const a = failedLogins.get(key);
+  return !!a && a.resetAt > now && a.count >= 10;
+}
+
+function countFailure(key: string, now: number) {
+  const a = failedLogins.get(key);
+  const fresh = !a || a.resetAt <= now;
+  failedLogins.set(key, { count: fresh ? 1 : a.count + 1, resetAt: fresh ? now + LOGIN_WINDOW_MS : a.resetAt });
+}
+
+app.post('/api/login', async (req, res) => {
+  const { username, password } = req.body ?? {};
+  const ipKey = `ip:${req.ip ?? 'unknown'}`;
+  const userKey = `user:${String(username ?? '').trim().toLowerCase()}`;
   const now = Date.now();
-  const attempts = failedLogins.get(ip);
-  if (attempts && attempts.resetAt > now && attempts.count >= 10) {
+  if (isLocked(ipKey, now) || isLocked(userKey, now)) {
     return res.status(429).json({ error: 'Đăng nhập sai quá nhiều lần, vui lòng thử lại sau 15 phút' });
   }
 
-  const { username, password } = req.body ?? {};
-  const userId = authenticate(String(username ?? ''), String(password ?? ''));
+  const userId = await authenticate(String(username ?? ''), String(password ?? ''));
   if (!userId) {
-    const fresh = !attempts || attempts.resetAt <= now;
-    failedLogins.set(ip, { count: fresh ? 1 : attempts.count + 1, resetAt: fresh ? now + LOGIN_WINDOW_MS : attempts.resetAt });
+    countFailure(ipKey, now);
+    countFailure(userKey, now);
     return res.status(401).json({ error: 'Sai tài khoản hoặc mật khẩu' });
   }
-  failedLogins.delete(ip);
+  failedLogins.delete(ipKey);
+  failedLogins.delete(userKey);
 
   const token = crypto.randomBytes(32).toString('hex');
   const maxAge = SESSION_HOURS * 3600 * 1000;
@@ -224,7 +238,8 @@ app.get('/api/records', (_req, res) => {
 });
 
 function sendSaveError(res: Response, err: unknown) {
-  res.status(err instanceof NotFoundError ? 404 : 400).json({ error: (err as Error).message });
+  const status = err instanceof NotFoundError ? 404 : err instanceof ConflictError ? 409 : 400;
+  res.status(status).json({ error: (err as Error).message });
 }
 
 app.post('/api/records', (req, res) => {
@@ -260,9 +275,9 @@ app.post('/api/records/import', async (req, res) => {
   try {
     // Import overwrites matching records; keep a copy of the DB to roll back to
     const snapshot = await snapshotDatabase('truoc-khi-nhap-file');
-    const imported = importRecords(clinicOf(res), req.body);
+    const result = importRecords(clinicOf(res), req.body);
     broadcast(clinicOf(res), 'records');
-    res.json({ imported, total: countRecords(clinicOf(res)), snapshot: path.basename(snapshot) });
+    res.json({ ...result, total: countRecords(clinicOf(res)), snapshot: path.basename(snapshot) });
   } catch (err) {
     sendSaveError(res, err);
   }
@@ -346,5 +361,5 @@ if (IS_PROD) {
 }
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Nha Khoa Đức Hạnh đang chạy tại http://localhost:${PORT} (${countRecords()} hồ sơ)`);
+  console.log(`Hệ thống quản lý nha khoa đang chạy tại http://localhost:${PORT} (${countRecords()} hồ sơ)`);
 });

@@ -107,7 +107,7 @@ export default function Login({ onLoginSuccess }: LoginProps) {
         </form>
 
         <div className="mt-8 text-center border-t border-slate-100 pt-4 text-xs text-slate-400">
-          Nha Khoa Bình Thuận · Nha Khoa Cư Bao &copy; 2026
+          Hệ thống quản lý hồ sơ nha khoa &copy; 2026
         </div>
       </div>
     </div>

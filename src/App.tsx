@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { api, UnauthorizedError } from './api';
+import { api, ConflictError, UnauthorizedError } from './api';
 import { DentalRecord, DentalRecordInput, PaymentRequest, PlanItem, ServiceItem, SessionInfo } from './types';
 
 // Subcomponents
@@ -14,6 +14,7 @@ import AppointmentsPanel from './components/AppointmentsPanel';
 import SettingsPanel from './components/SettingsPanel';
 import { printReceipt } from './utils/printReceipt';
 import { computeAppointments, todayStr } from './utils/stats';
+import { scopedStorage } from './utils/storage';
 
 // Icons
 import {
@@ -33,20 +34,15 @@ import {
   Settings,
 } from 'lucide-react';
 
-// Records saved by the old version of the app, before the SQLite server existed
-const LEGACY_STORAGE_KEY = 'dentalRecords';
 
 type Tab = 'dashboard' | 'patients' | 'appointments' | 'settings';
-const TAB_STORAGE_KEY = 'activeTab';
+const TABS: Tab[] = ['dashboard', 'patients', 'appointments', 'settings'];
 
-function readSavedTab(): Tab {
-  try {
-    const saved = localStorage.getItem(TAB_STORAGE_KEY);
-    if (saved === 'dashboard' || saved === 'patients' || saved === 'appointments' || saved === 'settings') return saved;
-  } catch {
-    // storage unavailable (private mode): fall back to the default tab
-  }
-  return 'dashboard';
+// Before per-account storage, the last tab was kept under one shared key
+try {
+  localStorage.removeItem('activeTab');
+} catch {
+  // storage unavailable: nothing to clean up
 }
 
 function sumPlans(plans: PlanItem[]) {
@@ -85,15 +81,24 @@ export default function App() {
   // Bumped after each save so the form remounts empty (prevents duplicate saves)
   const [formKey, setFormKey] = useState(0);
   const [isLive, setIsLive] = useState(false);
-  const [tab, setTabState] = useState<Tab>(readSavedTab);
+  const [tab, setTabState] = useState<Tab>('dashboard');
+
+  // Browser preferences are kept separately for each clinic account on this machine
+  const prefs = useMemo(
+    () => (session ? scopedStorage(session.clinic.slug, session.username) : null),
+    [session]
+  );
+
+  // Each account reopens on the tab it last used
+  useEffect(() => {
+    if (!prefs) return;
+    const saved = prefs.get('tab') as Tab | null;
+    setTabState(saved && TABS.includes(saved) ? saved : 'dashboard');
+  }, [prefs]);
 
   function setTab(next: Tab) {
     setTabState(next);
-    try {
-      localStorage.setItem(TAB_STORAGE_KEY, next);
-    } catch {
-      // ignore: remembering the tab is only a convenience
-    }
+    prefs?.set('tab', next);
   }
 
   // 3. Real-time dynamic clock tracking State
@@ -108,6 +113,8 @@ export default function App() {
   const [qrPatientName, setQrPatientName] = useState('');
   // Confirmed payments waiting to be acknowledged, oldest first (shown one at a time)
   const [paidQueue, setPaidQueue] = useState<PaymentRequest[]>([]);
+  // Server version of the record open in the form, sent back on save to detect conflicting edits
+  const [activeUpdatedAt, setActiveUpdatedAt] = useState<number | undefined>(undefined);
   const [appendedRow, setAppendedRow] = useState<{ recordId: number; row: PlanItem; seq: number } | null>(null);
   // Local date; ticks over at midnight so long-open tabs don't show yesterday's numbers
   const [today, setToday] = useState(todayStr());
@@ -166,7 +173,7 @@ export default function App() {
   useEffect(() => {
     if (authState !== 'in') return;
 
-    loadRecords().then(() => offerLegacyMigration());
+    loadRecords();
     loadServices();
 
     const events = new EventSource('/api/events');
@@ -202,34 +209,6 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // One-time move of data that the old version kept in this browser's localStorage
-  async function offerLegacyMigration() {
-    let legacy: unknown;
-    try {
-      legacy = JSON.parse(localStorage.getItem(LEGACY_STORAGE_KEY) || 'null');
-    } catch {
-      return;
-    }
-    if (!Array.isArray(legacy) || legacy.length === 0) return;
-
-    const ok = window.confirm(
-      `Trình duyệt này còn ${legacy.length} hồ sơ từ phiên bản cũ. Chuyển chúng vào cơ sở dữ liệu mới?\n` +
-        '(Hồ sơ trùng mã sẽ được cập nhật, không bị nhân đôi.)'
-    );
-    if (!ok) return;
-
-    try {
-      const res = await api.importRecords(legacy);
-      // Keep a copy under another key instead of deleting, just in case
-      localStorage.setItem(`${LEGACY_STORAGE_KEY}_migrated`, localStorage.getItem(LEGACY_STORAGE_KEY)!);
-      localStorage.removeItem(LEGACY_STORAGE_KEY);
-      alert(`Đã chuyển ${res.imported} hồ sơ. Tổng số hồ sơ hiện có: ${res.total}.`);
-      loadRecords();
-    } catch (err) {
-      handleApiError(err, 'Chuyển dữ liệu cũ thất bại');
-    }
-  }
-
   // ==========================================
   // SESSION CONTROL FUNCTIONS
   // ==========================================
@@ -257,21 +236,40 @@ export default function App() {
   async function handleSaveRecord(formData: DentalRecordInput) {
     try {
       if (activeRecord) {
-        await api.updateRecord(activeRecord.id, formData);
+        await api.updateRecord(activeRecord.id, { ...formData, updatedAt: activeUpdatedAt });
       } else {
         await api.createRecord(formData);
       }
       alert(`Lưu dữ liệu với tên ${formData.name} thành công`);
       setActiveRecord(null);
+      setAppendedRow(null);
       setFormKey((k) => k + 1);
       loadRecords();
     } catch (err) {
+      if (err instanceof ConflictError && activeRecord) {
+        const reload = window.confirm(
+          'Hồ sơ này vừa được cập nhật trên một máy khác, nên chưa lưu để tránh ghi đè.\n\n' +
+            'OK: tải bản mới nhất (các thay đổi bạn vừa nhập sẽ mất, hãy ghi lại trước nếu cần).\n' +
+            'Hủy: giữ nguyên màn hình để bạn chép lại thay đổi.'
+        );
+        if (reload) {
+          const fresh = (await api.listRecords()).find((r) => r.id === activeRecord.id);
+          if (fresh) handleEditRecord(fresh);
+          else handleCancelEdit();
+        }
+        return;
+      }
       handleApiError(err, 'Lưu hồ sơ thất bại');
     }
   }
 
   function handleEditRecord(record: DentalRecord) {
     setActiveRecord(record);
+    setActiveUpdatedAt(record.updatedAt);
+    // The form remounts from this server copy, which already contains any recorded payment
+    // row; a leftover pending row would otherwise be appended a second time
+    setAppendedRow(null);
+    setFormKey((k) => k + 1); // fresh form even when reopening the same patient
     setTab('patients');
     // Smooth scroll to the form once the patients tab has rendered
     setTimeout(() => document.getElementById('dentalForm')?.scrollIntoView({ behavior: 'smooth' }), 0);
@@ -294,6 +292,7 @@ export default function App() {
 
   function handleCancelEdit() {
     setActiveRecord(null);
+    setAppendedRow(null);
     setFormKey((k) => k + 1);
   }
 
@@ -351,7 +350,12 @@ export default function App() {
       setIsLoading(true);
       setLoadingText('Đang nhập dữ liệu vào cơ sở dữ liệu...');
       const res = await api.importRecords(dataParsed);
-      alert(`Đã nhập ${res.imported} hồ sơ. Tổng số hồ sơ hiện có: ${res.total}.`);
+      alert(
+        `Đã nhập ${res.imported} hồ sơ. Tổng số hồ sơ hiện có: ${res.total}.` +
+          (res.skippedOtherClinic
+            ? `\n\nBỏ qua ${res.skippedOtherClinic} hồ sơ thuộc nha khoa khác (file này có dữ liệu của nha khoa khác, không nhập để hai nha khoa không lẫn nhau).`
+            : '')
+      );
       loadRecords();
     } catch (err) {
       handleApiError(err, 'Có lỗi xảy ra khi nhập dữ liệu file');
@@ -429,6 +433,7 @@ export default function App() {
       const row = updated.plan[updated.plan.length - 1];
       if (activeRecord?.id === updated.id && row) {
         setAppendedRow((prev) => ({ recordId: updated.id, row, seq: (prev?.seq ?? 0) + 1 }));
+        setActiveUpdatedAt(updated.updatedAt); // our own change: not a conflict
       }
       loadRecords();
       return true;

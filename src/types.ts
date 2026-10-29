@@ -16,6 +16,7 @@ export interface DentalRecord {
   dob: string; // Age (Tuổi)
   visitDate: string;
   appointment: string;
+  updatedAt?: number; // server timestamp of the last save, sent back to detect conflicting edits
   plan: PlanItem[];
 }
 
